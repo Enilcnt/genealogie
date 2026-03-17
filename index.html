@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Mémoires — Arbre Généalogique</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet"/>
+  <link rel="stylesheet" href="style.css"/>
+</head>
+<body>
+<div id="app">
+  <header id="header">
+    <div class="header-inner">
+      <a class="site-brand" href="index.html">
+        <span class="site-title">MÉMOIRES</span>
+        <span class="site-sub">Arbre généalogique</span>
+      </a>
+      <nav class="header-nav">
+        <a href="index.html"  class="nav-link active">Arbre</a>
+        <a href="saisie.html" class="nav-add">+ Ajouter</a>
+      </nav>
+      <div class="search-wrap">
+        <input id="search" type="text" placeholder="Rechercher…" autocomplete="off"/>
+        <ul id="search-results"></ul>
+      </div>
+      <div class="legend">
+        <span class="leg"><span class="leg-line parent"></span>Filiation</span>
+        <span class="leg"><span class="leg-line married"></span>Union</span>
+        <span class="leg"><span class="leg-line sibling"></span>Fratrie</span>
+      </div>
+    </div>
+  </header>
+
+  <div id="graph-container">
+    <svg id="graph"></svg>
+    <div id="zoom-btns">
+      <button id="btn-in">+</button>
+      <button id="btn-reset" style="font-size:.65rem">⌖</button>
+      <button id="btn-out">−</button>
+    </div>
+    <div id="loading-overlay">
+      <div class="spinner"></div>
+      <p>Chargement de l'arbre…</p>
+    </div>
+    <div id="empty-state">
+      <p>L'arbre est vide pour l'instant.</p>
+      <a href="saisie.html" class="btn-primary" style="margin-top:12px">Ajouter la première personne →</a>
+    </div>
+  </div>
+
+  <aside id="panel" class="panel-closed">
+    <button id="panel-close">✕</button>
+    <div id="panel-content"></div>
+  </aside>
+  <div id="overlay"></div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+<script type="module">
+  import { initializeApp }  from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+  import { getFirestore, collection, getDocs, query, orderBy }
+                            from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+  import { FIREBASE_CONFIG } from './firebase-config.js';
+
+  const app = initializeApp(FIREBASE_CONFIG);
+  const db  = getFirestore(app);
+  const $   = id => document.getElementById(id);
+
+  /* ── CONSTANTES ── */
+  const R       = 27;
+  const LABEL_H = 26;
+  const COL_W   = 150;
+  const CONJ_GAP= 90;
+  const ROW_H   = 140;
+  const PAD_T   = 55;
+  const FRAT_GAP= 12;
+
+  const LINK_STYLE = {
+    parent:  {stroke:'#2b2b28', w:1.8, op:.55, dash:null},
+    married: {stroke:'#8a8880', w:1.5, op:.50, dash:null},
+    sibling: {stroke:'#c0beb6', w:1.2, op:.75, dash:'6,4'},
+  };
+
+  function getLabel(p, scale) {
+    if (scale > 0.90) return p.name;
+    const parts = p.name.split(' ');
+    if (scale > 0.55) return parts[0] + (parts[1] ? ' ' + parts[1][0] + '.' : '');
+    if (scale > 0.32) return parts[0];
+    return parts.map(w => w[0]).slice(0,2).join('').toUpperCase();
+  }
+
+  let allPersons = [], allLinks = [], svgSel, zoomGroup, zoomBeh, selectedId = null;
+
+  async function loadData() {
+    const [pSnap, lSnap] = await Promise.all([
+      getDocs(query(collection(db,'persons'), orderBy('name'))),
+      getDocs(collection(db,'links'))
+    ]);
+    allPersons = pSnap.docs.map(d => ({id: d.id, ...d.data()}));
+    allLinks   = lSnap.docs.map(d => ({id: d.id, ...d.data()}));
+    $('loading-overlay').style.display = 'none';
+    if (!allPersons.length) { $('empty-state').style.display = 'flex'; return; }
+    buildTree();
+    buildSearch();
+  }
+
+  function buildTree() {
+    const cont = $('graph-container');
+    const W = cont.clientWidth, H = cont.clientHeight;
+
+    /* ── POSITIONS FIXES PAR GÉNÉRATION ── */
+    const byGen = {};
+    allPersons.forEach(p => { (byGen[p.generation||1] = byGen[p.generation||1]||[]).push(p); });
+    const GEN_MAX = Math.max(...Object.keys(byGen).map(Number));
+
+    /* Couples & fratrie depuis les liens */
+    const spouseOf = {};
+    const childrenOf = {}; /* parentId → [childIds] */
+    allLinks.forEach(l => {
+      if (l.type === 'married') { spouseOf[l.source] = l.target; spouseOf[l.target] = l.source; }
+      if (l.type === 'parent')  { (childrenOf[l.source] = childrenOf[l.source]||[]).push(l.target); }
+    });
+
+    /* Noyau (frères/sœurs) par enfant */
+    const nucleus = {};
+    Object.values(childrenOf).forEach(children => {
+      children.forEach(id => { nucleus[id] = children; });
+    });
+
+    const pos = {};
+
+    for (let g = 1; g <= GEN_MAX; g++) {
+      const group = byGen[g] || [];
+      if (!group.length) continue;
+      const y = PAD_T + (g - 1) * ROW_H + R;
+
+      /* Identifier noyaux uniques */
+      const seen = new Set();
+      const nuclei = [];
+      group.forEach(p => {
+        const nuc = nucleus[p.id] ? nucleus[p.id].filter(id => group.find(x => x.id === id)) : [p.id];
+        const key = nuc.slice().sort().join(',');
+        if (!seen.has(key)) { seen.add(key); nuclei.push(nuc); }
+      });
+
+      const inGenIds = new Set(group.map(p => p.id));
+
+      /* Largeur totale */
+      const nucleiData = nuclei.map(nuc => {
+        const firstId = nuc[0], lastId = nuc[nuc.length - 1];
+        const spFirst = spouseOf[firstId], spLast = spouseOf[lastId];
+        const conjLeft  = (spFirst && inGenIds.has(spFirst) && !nucleus[spFirst]) ? CONJ_GAP * 0.8 : 0;
+        const conjRight = (spLast  && inGenIds.has(spLast)  && !nucleus[spLast])  ? CONJ_GAP * 0.8 : 0;
+        return { nuc, conjLeft, conjRight, w: conjLeft + (nuc.length - 1) * COL_W + conjRight };
+      });
+
+      const totalW = nucleiData.reduce((s, n) => s + n.w, 0) + (nucleiData.length - 1) * COL_W;
+      const TOTAL_W = Math.max(W, totalW + 120);
+      let curX = (TOTAL_W - totalW) / 2;
+
+      nucleiData.forEach(({ nuc, conjLeft, conjRight }) => {
+        curX += conjLeft;
+        nuc.forEach((id, i) => { pos[id] = { x: curX + i * COL_W, y }; });
+        const firstId = nuc[0], lastId = nuc[nuc.length - 1];
+        const spFirst = spouseOf[firstId], spLast = spouseOf[lastId];
+        if (spFirst && inGenIds.has(spFirst) && !nucleus[spFirst]) pos[spFirst] = { x: curX - conjLeft * 0.7, y };
+        if (spLast  && inGenIds.has(spLast)  && !nucleus[spLast])  pos[spLast]  = { x: curX + (nuc.length - 1) * COL_W + conjRight * 0.7, y };
+        curX += (nuc.length - 1) * COL_W + conjRight + COL_W;
+      });
+    }
+
+    /* Calculer dimensions SVG */
+    const allX = Object.values(pos).map(p => p.x);
+    const allY = Object.values(pos).map(p => p.y);
+    const TOTAL_W = Math.max(W, Math.max(...allX) + 100);
+    const TOTAL_H = Math.max(H, Math.max(...allY) + R + LABEL_H + FRAT_GAP + 60);
+
+    svgSel = d3.select('#graph').attr('width', W).attr('height', H);
+
+    const defs = svgSel.append('defs');
+    allPersons.forEach(p => {
+      defs.append('clipPath').attr('id','clip-'+p.id).append('circle').attr('r', R);
+      if (p.mainPhoto) {
+        const pat = defs.append('pattern').attr('id','img-'+p.id)
+          .attr('patternContentUnits','objectBoundingBox').attr('width',1).attr('height',1);
+        pat.append('image').attr('href', p.mainPhoto).attr('width',1).attr('height',1)
+          .attr('preserveAspectRatio','xMidYMid slice');
+      }
+    });
+
+    const initK  = Math.min(1, (W - 40) / TOTAL_W);
+    const initTx = Math.max(0, (W - TOTAL_W * initK) / 2);
+    const startT = d3.zoomIdentity.translate(initTx, 10).scale(initK);
+
+    zoomGroup = svgSel.append('g');
+    const lineG = zoomGroup.append('g');
+    const nodeG = zoomGroup.append('g');
+
+    /* ── TRACÉ DES LIENS ORTHOGONAUX ── */
+    /* Unions */
+    const drawnUnions = new Set();
+    allLinks.forEach(l => {
+      if (l.type !== 'married') return;
+      const key = [l.source, l.target].sort().join(',');
+      if (drawnUnions.has(key)) return;
+      drawnUnions.add(key);
+      const pa = pos[l.source], pb = pos[l.target];
+      if (!pa || !pb) return;
+      lineG.append('line')
+        .attr('x1', Math.min(pa.x, pb.x) + R).attr('y1', pa.y)
+        .attr('x2', Math.max(pa.x, pb.x) - R).attr('y2', pb.y)
+        .attr('stroke', LINK_STYLE.married.stroke)
+        .attr('stroke-width', LINK_STYLE.married.w)
+        .attr('stroke-opacity', LINK_STYLE.married.op);
+    });
+
+    /* Filiations */
+    const parentGroups = {};
+    allLinks.forEach(l => {
+      if (l.type !== 'parent') return;
+      (parentGroups[l.source] = parentGroups[l.source]||[]).push(l.target);
+    });
+    Object.entries(parentGroups).forEach(([parentId, childIds]) => {
+      const pA = pos[parentId]; if (!pA) return;
+      const sp = spouseOf[parentId];
+      const pB = sp ? pos[sp] : null;
+      const srcX = pB ? (pA.x + pB.x) / 2 : pA.x;
+      const srcY = pA.y;
+      const childPositions = childIds.map(id => pos[id]).filter(Boolean);
+      if (!childPositions.length) return;
+      const childMinX = Math.min(...childPositions.map(p => p.x));
+      const childMaxX = Math.max(...childPositions.map(p => p.x));
+      const childY    = childPositions[0].y;
+      const midY      = (srcY + childY) / 2;
+      const centerX   = (childMinX + childMaxX) / 2;
+      const s = LINK_STYLE.parent;
+
+      lineG.append('line').attr('x1',srcX).attr('y1',srcY+R).attr('x2',srcX).attr('y2',midY)
+        .attr('stroke',s.stroke).attr('stroke-width',s.w).attr('stroke-opacity',s.op);
+      if (Math.abs(srcX - centerX) > 2)
+        lineG.append('line').attr('x1',srcX).attr('y1',midY).attr('x2',centerX).attr('y2',midY)
+          .attr('stroke',s.stroke).attr('stroke-width',s.w).attr('stroke-opacity',s.op);
+      if (childIds.length > 1)
+        lineG.append('line').attr('x1',childMinX).attr('y1',midY).attr('x2',childMaxX).attr('y2',midY)
+          .attr('stroke',s.stroke).attr('stroke-width',s.w).attr('stroke-opacity',s.op);
+      childPositions.forEach(cp => {
+        lineG.append('line').attr('x1',cp.x).attr('y1',midY).attr('x2',cp.x).attr('y2',cp.y-R)
+          .attr('stroke',s.stroke).attr('stroke-width',s.w).attr('stroke-opacity',s.op);
+      });
+    });
+
+    /* Fratrie */
+    const drawnFrat = new Set();
+    Object.values(childrenOf).forEach(siblings => {
+      if (siblings.length < 2) return;
+      const key = siblings.slice().sort().join(',');
+      if (drawnFrat.has(key)) return;
+      drawnFrat.add(key);
+      const positions = siblings.map(id => pos[id]).filter(Boolean);
+      if (positions.length < 2) return;
+      const minX  = Math.min(...positions.map(p => p.x));
+      const maxX  = Math.max(...positions.map(p => p.x));
+      const fratY = positions[0].y + R + LABEL_H + FRAT_GAP;
+      const s = LINK_STYLE.sibling;
+      lineG.append('line').attr('x1',minX).attr('y1',fratY).attr('x2',maxX).attr('y2',fratY)
+        .attr('stroke',s.stroke).attr('stroke-width',s.w).attr('stroke-opacity',s.op)
+        .attr('stroke-dasharray',s.dash);
+    });
+
+    /* ── NOEUDS ── */
+    allPersons.forEach(p => {
+      const pt = pos[p.id]; if (!pt) return;
+      const g = nodeG.append('g')
+        .attr('transform', `translate(${pt.x},${pt.y})`)
+        .attr('id', 'node-'+p.id)
+        .style('cursor','pointer');
+
+      g.append('circle').attr('class','ring')
+        .attr('r',R+5).attr('fill','none')
+        .attr('stroke','#111110').attr('stroke-width',0).attr('opacity',0);
+
+      g.append('circle').attr('r',R)
+        .attr('fill', p.mainPhoto ? `url(#img-${p.id})` : '#f0efed')
+        .attr('stroke','rgba(255,255,255,0.85)').attr('stroke-width',2)
+        .style('filter','drop-shadow(3px 3px 6px rgba(0,0,0,0.09)) drop-shadow(-2px -2px 4px rgba(255,255,255,0.70))');
+
+      if (!p.mainPhoto) {
+        const parts = p.name.split(' ');
+        const ini = parts.map(w=>w[0]).slice(0,2).join('').toUpperCase();
+        g.append('text').attr('text-anchor','middle').attr('dominant-baseline','central')
+          .attr('font-size','11px').attr('font-weight','600')
+          .attr('fill','#47463f').attr('pointer-events','none').text(ini);
+      }
+
+      g.append('text').attr('class','lbl').attr('data-id', p.id)
+        .attr('y', R+14).attr('text-anchor','middle')
+        .attr('font-family','var(--font)').attr('font-size','11px').attr('font-weight','500')
+        .attr('fill','#47463f').attr('pointer-events','none');
+
+      g.on('mouseenter', function() { d3.select(this).select('.ring').attr('stroke-width',2.5).attr('opacity',.22); })
+       .on('mouseleave', function() {
+         if (selectedId !== p.id) d3.select(this).select('.ring').attr('stroke-width',0).attr('opacity',0);
+       })
+       .on('click', (e) => { e.stopPropagation(); openPanel(p.id); });
+    });
+
+    /* ── ZOOM ── */
+    zoomBeh = d3.zoom().scaleExtent([0.12, 3]).on('zoom', e => {
+      zoomGroup.attr('transform', e.transform);
+      updateLabels(e.transform.k);
+    });
+    svgSel.call(zoomBeh).on('dblclick.zoom', null);
+    svgSel.call(zoomBeh.transform, startT);
+    svgSel.on('click', closePanel);
+    updateLabels(initK);
+
+    $('btn-in').onclick     = () => svgSel.transition().duration(280).call(zoomBeh.scaleBy, 1.5);
+    $('btn-out').onclick    = () => svgSel.transition().duration(280).call(zoomBeh.scaleBy, 0.67);
+    $('btn-reset').onclick  = () => svgSel.transition().duration(450).call(zoomBeh.transform, startT);
+
+    window.addEventListener('resize', () => {
+      svgSel.attr('width', cont.clientWidth).attr('height', cont.clientHeight);
+    });
+  }
+
+  function updateLabels(scale) {
+    d3.selectAll('.lbl').each(function() {
+      const id = d3.select(this).attr('data-id');
+      const p  = allPersons.find(x => x.id === id);
+      if (p) d3.select(this).text(getLabel(p, scale));
+    });
+  }
+
+  /* ── PANEL ── */
+  function openPanel(id) {
+    const p = allPersons.find(x => x.id === id); if (!p) return;
+    if (selectedId) unhighlight(selectedId);
+    selectedId = id; highlight(id);
+
+    const parts = p.name.split(' ');
+    const firstName = parts[0], lastName = parts.slice(1).join(' ');
+
+    const photo = p.mainPhoto
+      ? `<div class="panel-photo-wrap"><img src="${p.mainPhoto}" alt="${p.name}" loading="lazy"/></div>`
+      : `<div class="panel-no-photo">👤</div>`;
+
+    const dates = [p.birth ? `✦ ${p.birth}` : '', p.death ? `† ${p.death}` : ''].filter(Boolean).join('  —  ');
+
+    let galleryHTML = '';
+    if (p.photos && p.photos.length > 1) {
+      const extras = p.photos.filter(u => u !== p.mainPhoto);
+      if (extras.length) {
+        galleryHTML = `<div class="panel-gallery">${extras.map(u => `<img src="${u}" alt="" loading="lazy"/>`).join('')}</div>`;
+      }
+    }
+
+    $('panel-content').innerHTML = `
+      ${photo}
+      <div class="panel-firstname">${firstName}</div>
+      <div class="panel-lastname">${lastName || firstName}</div>
+      ${dates ? `<div class="panel-dates">${dates}</div>` : ''}
+      <hr class="panel-div"/>
+      <p class="panel-bio">${p.bio || '<span style="opacity:.4;font-style:italic">Aucune biographie.</span>'}</p>
+      ${galleryHTML}
+      <div class="panel-edit-wrap"><a href="saisie.html?edit=${id}" class="btn-edit">✎ Modifier cette fiche</a></div>
+    `;
+
+    $('panel').classList.add('panel-open');
+    $('panel').classList.remove('panel-closed');
+    $('overlay').classList.add('visible');
+  }
+
+  function closePanel() {
+    $('panel').className = 'panel-closed';
+    $('overlay').classList.remove('visible');
+    if (selectedId) { unhighlight(selectedId); selectedId = null; }
+  }
+  function highlight(id) {
+    d3.selectAll('g').filter(d => false); // reset
+    d3.select('#node-'+id).select('.ring').attr('stroke-width',3).attr('opacity',.3);
+  }
+  function unhighlight(id) {
+    d3.select('#node-'+id).select('.ring').attr('stroke-width',0).attr('opacity',0);
+  }
+
+  function buildSearch() {
+    const inp = $('search'), res = $('search-results');
+    inp.addEventListener('input', () => {
+      const q = inp.value.trim().toLowerCase(); res.innerHTML = '';
+      if (!q) { res.className = ''; return; }
+      const m = allPersons.filter(p => p.name.toLowerCase().includes(q)).slice(0,8);
+      if (!m.length) { res.className = ''; return; }
+      m.forEach(p => {
+        const li = document.createElement('li'); li.textContent = p.name;
+        li.onclick = () => { openPanel(p.id); inp.value = ''; res.className = ''; };
+        res.appendChild(li);
+      });
+      res.className = 'visible';
+    });
+    document.addEventListener('click', e => { if (!e.target.closest('.search-wrap')) res.className = ''; });
+  }
+
+  $('panel-close').onclick = e => { e.stopPropagation(); closePanel(); };
+  $('overlay').onclick = closePanel;
+
+  loadData();
+</script>
+</body>
+</html>
