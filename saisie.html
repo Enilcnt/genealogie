@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Mémoires — Ajouter une personne</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@400;600&family=Cormorant+Garamond:ital,wght@0,300;0,400;0,600;1,400&family=EB+Garamond:ital,wght@0,400;1,400&display=swap" rel="stylesheet"/>
+  <link rel="stylesheet" href="style.css"/>
+  <link rel="stylesheet" href="saisie.css"/>
+</head>
+<body class="saisie-page">
+<div id="app">
+
+  <header id="header">
+    <div class="header-inner">
+      <a class="site-brand" href="index.html">
+        <span class="site-title">MÉMOIRES</span>
+        <span class="site-sub">Arbre Généalogique</span>
+      </a>
+      <nav class="header-nav">
+        <a href="index.html"  class="nav-link">Arbre</a>
+        <a href="saisie.html" class="nav-link active">+ Ajouter</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="form-main">
+    <div class="form-card">
+      <div class="form-header">
+        <h1 id="form-title">Nouvelle personne</h1>
+        <p class="form-sub">Remplis les informations puis enregistre la fiche.</p>
+      </div>
+
+      <!-- IDENTITÉ -->
+      <section class="form-section">
+        <h2 class="section-title">Identité</h2>
+        <div class="field-row">
+          <div class="field">
+            <label for="f-prenom">Prénom <span class="req">*</span></label>
+            <input type="text" id="f-prenom" placeholder="Marie" required/>
+          </div>
+          <div class="field">
+            <label for="f-nom">Nom de famille <span class="req">*</span></label>
+            <input type="text" id="f-nom" placeholder="Dupont" required/>
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label for="f-nom-jeune">Nom de jeune fille</label>
+            <input type="text" id="f-nom-jeune" placeholder="(optionnel)"/>
+          </div>
+          <div class="field">
+            <label for="f-surnom">Surnom / dit(e)</label>
+            <input type="text" id="f-surnom" placeholder="(optionnel)"/>
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label for="f-birth">Date de naissance</label>
+            <input type="text" id="f-birth" placeholder="ex: 12/03/1945 ou 1945"/>
+          </div>
+          <div class="field">
+            <label for="f-death">Date de décès</label>
+            <input type="text" id="f-death" placeholder="Laisser vide si vivant(e)"/>
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label for="f-birth-lieu">Lieu de naissance</label>
+            <input type="text" id="f-birth-lieu" placeholder="Ville, pays"/>
+          </div>
+          <div class="field">
+            <label for="f-generation">Génération</label>
+            <select id="f-generation">
+              <option value="1">1 — Arrière-arrière-grands-parents</option>
+              <option value="2">2 — Arrière-grands-parents</option>
+              <option value="3">3 — Grands-parents</option>
+              <option value="4" selected>4 — Parents</option>
+              <option value="5">5 — Moi / frères et sœurs</option>
+              <option value="6">6 — Enfants</option>
+              <option value="7">7 — Petits-enfants</option>
+            </select>
+          </div>
+        </div>
+        <div class="field">
+          <label for="f-bio">Biographie / anecdotes</label>
+          <textarea id="f-bio" rows="5" placeholder="Quelques phrases sur cette personne, son métier, sa vie…"></textarea>
+        </div>
+      </section>
+
+      <!-- LIEN FAMILIAL -->
+      <section class="form-section">
+        <h2 class="section-title">Lien familial</h2>
+        <p class="section-hint">Associe cette personne à quelqu'un déjà dans l'arbre.</p>
+        <div class="field-row link-row">
+          <div class="field">
+            <label for="f-link-type">Cette personne est le/la</label>
+            <select id="f-link-type">
+              <option value="">— Aucun lien pour l'instant —</option>
+              <optgroup label="Lien direct">
+                <option value="parent|b">Père / Mère de…</option>
+                <option value="parent|f">Fils / Fille de…</option>
+                <option value="married|f">Conjoint(e) de…</option>
+                <option value="sibling|f">Frère / Sœur de…</option>
+              </optgroup>
+              <optgroup label="Famille élargie">
+                <option value="sibling|f">Cousin(e) de…</option>
+                <option value="sibling|f">Oncle / Tante de…</option>
+                <option value="parent|b">Grand-père / Grand-mère de…</option>
+                <option value="parent|f">Petit-fils / Petite-fille de…</option>
+              </optgroup>
+            </select>
+          </div>
+          <div class="field">
+            <label for="f-link-person">… de</label>
+            <div class="autocomplete-wrap">
+              <input type="text" id="f-link-person" placeholder="Tapez un nom…" autocomplete="off"/>
+              <input type="hidden" id="f-link-person-id"/>
+              <ul id="link-person-results"></ul>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- PHOTOS -->
+      <section class="form-section">
+        <h2 class="section-title">Photos</h2>
+        <p class="section-hint">
+          Téléverse autant de photos que tu veux.<br/>
+          Clique ensuite sur <strong style="color:var(--gold)">★</strong> pour choisir la photo principale affichée sur l'arbre.
+        </p>
+        <div id="drop-zone" class="drop-zone">
+          <input type="file" id="photo-input" multiple accept="image/*" style="display:none"/>
+          <div class="drop-inner">
+            <span class="drop-icon">🖼</span>
+            <p>Glisse tes photos ici<br/><span>ou</span></p>
+            <button type="button" class="btn-secondary" onclick="document.getElementById('photo-input').click()">Choisir des fichiers</button>
+          </div>
+        </div>
+        <div id="photo-grid" class="photo-grid"></div>
+        <div id="upload-progress" style="display:none;margin-top:12px">
+          <div class="progress-bar-wrap">
+            <div id="progress-bar" class="progress-bar" style="width:0%"></div>
+          </div>
+          <p id="progress-label" class="progress-label">Upload en cours…</p>
+        </div>
+      </section>
+
+      <!-- ACTIONS -->
+      <div class="form-actions">
+        <button type="button" class="btn-ghost" onclick="window.location='index.html'">Annuler</button>
+        <button type="button" id="btn-save" class="btn-primary">
+          <span id="btn-save-text">Enregistrer la fiche</span>
+          <span id="btn-save-spinner" class="btn-spinner" style="display:none"></span>
+        </button>
+      </div>
+      <div id="form-error"   class="form-msg error"   style="display:none"></div>
+      <div id="form-success" class="form-msg success" style="display:none"></div>
+    </div>
+  </main>
+</div>
+
+<script type="module">
+  import { initializeApp }  from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+  import { getFirestore, collection, addDoc, updateDoc, getDoc, getDocs,
+           doc, query, orderBy, setDoc }
+                            from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+  import { FIREBASE_CONFIG, CLOUDINARY_CLOUD_NAME, CLOUDINARY_UPLOAD_PRESET }
+                            from './firebase-config.js';
+
+  const app = initializeApp(FIREBASE_CONFIG);
+  const db  = getFirestore(app);
+  const $   = id => document.getElementById(id);
+
+  const params = new URLSearchParams(location.search);
+  const editId = params.get('edit');
+  const isEdit = !!editId;
+  if (isEdit) $('form-title').textContent = 'Modifier la fiche';
+
+  const LINK_DB = {
+    'parent|b':'parent', 'parent|f':'parent',
+    'married|f':'married', 'sibling|f':'sibling',
+  };
+  const LINK_DIR = {
+    'parent|b':'normal', 'parent|f':'reverse',
+    'married|f':'normal', 'sibling|f':'normal',
+  };
+
+  /* ── CLOUDINARY UPLOAD ── */
+  async function uploadToCloudinary(file, onProgress) {
+    const fd = new FormData();
+    fd.append('file', file);
+    fd.append('upload_preset', CLOUDINARY_UPLOAD_PRESET);
+    fd.append('folder', 'genealogie');
+
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.upload.addEventListener('progress', e => {
+        if (e.lengthComputable) onProgress(Math.round(e.loaded/e.total*100));
+      });
+      xhr.addEventListener('load', () => {
+        if (xhr.status === 200) {
+          const data = JSON.parse(xhr.responseText);
+          resolve(data.secure_url);
+        } else {
+          reject(new Error('Cloudinary upload failed: ' + xhr.responseText));
+        }
+      });
+      xhr.addEventListener('error', () => reject(new Error('Réseau : upload échoué')));
+      xhr.open('POST', `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/image/upload`);
+      xhr.send(fd);
+    });
+  }
+
+  /* ── PERSONS FOR AUTOCOMPLETE ── */
+  let allPersons = [];
+  async function loadPersons() {
+    const snap = await getDocs(query(collection(db,'persons'), orderBy('name')));
+    allPersons = snap.docs.map(d=>({id:d.id,...d.data()}));
+    if (isEdit) {
+      allPersons = allPersons.filter(p=>p.id!==editId);
+      await prefillForm();
+    }
+  }
+
+  async function prefillForm() {
+    const snap = await getDoc(doc(db,'persons',editId));
+    if (!snap.exists()) return;
+    const p = snap.data();
+    const parts = (p.name||'').split(' ');
+    $('f-prenom').value     = parts[0]||'';
+    $('f-nom').value        = parts.slice(1).join(' ')||'';
+    $('f-nom-jeune').value  = p.nomJeuneFille||'';
+    $('f-surnom').value     = p.surnom||'';
+    $('f-birth').value      = p.birth||'';
+    $('f-death').value      = p.death||'';
+    $('f-birth-lieu').value = p.birthPlace||'';
+    $('f-generation').value = p.generation||4;
+    $('f-bio').value        = p.bio||'';
+    if (p.photos) p.photos.forEach((url,i) => addPhotoCard(null, url, url, url===p.mainPhoto));
+  }
+
+  /* ── LINK AUTOCOMPLETE ── */
+  const linkInp = $('f-link-person');
+  const linkRes = $('link-person-results');
+  const linkId  = $('f-link-person-id');
+  linkInp.addEventListener('input', ()=>{
+    const q=linkInp.value.trim().toLowerCase(); linkRes.innerHTML='';
+    if(!q){linkRes.className='';return;}
+    const m=allPersons.filter(p=>p.name.toLowerCase().includes(q)).slice(0,8);
+    if(!m.length){linkRes.className='';return;}
+    m.forEach(p=>{
+      const li=document.createElement('li'); li.textContent=p.name;
+      li.onclick=()=>{linkInp.value=p.name;linkId.value=p.id;linkRes.className='';};
+      linkRes.appendChild(li);
+    });
+    linkRes.className='visible';
+  });
+  document.addEventListener('click',e=>{if(!e.target.closest('.autocomplete-wrap'))linkRes.className='';});
+
+  /* ── PHOTO GRID ── */
+  let photoItems=[], mainIndex=0;
+
+  function renderGrid(){
+    const grid=$('photo-grid'); grid.innerHTML='';
+    photoItems.forEach((item,i)=>{
+      const card=document.createElement('div');
+      card.className='photo-card'+(i===mainIndex?' is-main':'');
+      const img=document.createElement('img'); img.src=item.url; img.alt='';
+      card.appendChild(img);
+      const star=document.createElement('button'); star.type='button';
+      star.className='photo-star'+(i===mainIndex?' active':'');
+      star.title='Photo principale'; star.innerHTML='★';
+      star.onclick=()=>{mainIndex=i;renderGrid();};
+      card.appendChild(star);
+      const del=document.createElement('button'); del.type='button';
+      del.className='photo-del'; del.title='Supprimer'; del.innerHTML='✕';
+      del.onclick=()=>{photoItems.splice(i,1);if(mainIndex>=photoItems.length)mainIndex=0;renderGrid();};
+      card.appendChild(del);
+      if(i===mainIndex){const b=document.createElement('span');b.className='photo-main-badge';b.textContent='Principale';card.appendChild(b);}
+      grid.appendChild(card);
+    });
+  }
+
+  function addPhotoCard(file,url,existingUrl=null,isMain=false){
+    photoItems.push({file,url,existingUrl});
+    if(isMain||photoItems.length===1) mainIndex=photoItems.length-1;
+    renderGrid();
+  }
+
+  $('photo-input').addEventListener('change',e=>{
+    Array.from(e.target.files).forEach(f=>addPhotoCard(f,URL.createObjectURL(f)));
+    $('photo-input').value='';
+  });
+  const dz=$('drop-zone');
+  dz.addEventListener('dragover',e=>{e.preventDefault();dz.classList.add('drag-over');});
+  dz.addEventListener('dragleave',()=>dz.classList.remove('drag-over'));
+  dz.addEventListener('drop',e=>{
+    e.preventDefault();dz.classList.remove('drag-over');
+    Array.from(e.dataTransfer.files).filter(f=>f.type.startsWith('image/')).forEach(f=>addPhotoCard(f,URL.createObjectURL(f)));
+  });
+
+  /* ── SAVE ── */
+  $('btn-save').addEventListener('click', async ()=>{
+    $('form-error').style.display='none';
+    const prenom=$('f-prenom').value.trim(), nom=$('f-nom').value.trim();
+    if(!prenom||!nom){showError('Le prénom et le nom sont obligatoires.');return;}
+    setBusy(true);
+
+    try {
+      const personId = isEdit ? editId : crypto.randomUUID().replace(/-/g,'').slice(0,20);
+      const name=prenom+' '+nom;
+
+      // upload new photos to Cloudinary
+      const uploadedUrls=[];
+      const newItems=photoItems.filter(item=>item.file&&!item.existingUrl);
+      const existingItems=photoItems.filter(item=>item.existingUrl);
+
+      existingItems.forEach(item=>uploadedUrls.push({item,url:item.existingUrl}));
+
+      if(newItems.length){
+        $('upload-progress').style.display='block';
+        for(let i=0;i<newItems.length;i++){
+          const item=newItems[i];
+          $('progress-label').textContent=`Upload photo ${i+1}/${newItems.length}…`;
+          const url=await uploadToCloudinary(item.file, pct=>{
+            const base=(i/newItems.length)*100, chunk=pct/newItems.length;
+            $('progress-bar').style.width=(base+chunk)+'%';
+          });
+          uploadedUrls.push({item,url});
+          item.existingUrl=url;
+        }
+        $('progress-bar').style.width='100%';
+        $('progress-label').textContent='Upload terminé !';
+      }
+
+      // rebuild ordered URL list matching photoItems order
+      const finalUrls=photoItems.map(item=>{
+        if(item.existingUrl) return item.existingUrl;
+        const found=uploadedUrls.find(x=>x.item===item);
+        return found?found.url:null;
+      }).filter(Boolean);
+
+      const mainPhoto=finalUrls[mainIndex]||finalUrls[0]||null;
+
+      const data={
+        name, nomJeuneFille:$('f-nom-jeune').value.trim()||'',
+        surnom:$('f-surnom').value.trim()||'',
+        birth:$('f-birth').value.trim()||'',
+        death:$('f-death').value.trim()||'',
+        birthPlace:$('f-birth-lieu').value.trim()||'',
+        generation:parseInt($('f-generation').value)||4,
+        bio:$('f-bio').value.trim()||'',
+        photos:finalUrls, mainPhoto,
+        updatedAt:new Date().toISOString(),
+      };
+      if(!isEdit) data.createdAt=new Date().toISOString();
+
+      if(isEdit) await updateDoc(doc(db,'persons',editId),data);
+      else await setDoc(doc(db,'persons',personId),data);
+
+      // save link
+      const linkType=$('f-link-type').value, linkPerId=$('f-link-person-id').value;
+      if(linkType&&linkPerId){
+        const dbType=LINK_DB[linkType]||'sibling';
+        const dir=LINK_DIR[linkType]||'normal';
+        await addDoc(collection(db,'links'),{
+          source:dir==='normal'?personId:linkPerId,
+          target:dir==='normal'?linkPerId:personId,
+          type:dbType, label:linkType,
+        });
+      }
+
+      showSuccess(isEdit?'Fiche mise à jour !':'Personne ajoutée à l\'arbre !');
+      setTimeout(()=>window.location='index.html',1500);
+
+    } catch(err){
+      console.error(err);
+      showError('Erreur : '+err.message);
+      setBusy(false);
+    }
+  });
+
+  function setBusy(b){
+    $('btn-save').disabled=b;
+    $('btn-save-text').style.display=b?'none':'';
+    $('btn-save-spinner').style.display=b?'inline-block':'none';
+  }
+  function showError(msg){const el=$('form-error');el.textContent=msg;el.style.display='block';el.scrollIntoView({behavior:'smooth',block:'center'});}
+  function showSuccess(msg){const el=$('form-success');el.textContent=msg;el.style.display='block';}
+
+  loadPersons();
+</script>
+</body>
+</html>
