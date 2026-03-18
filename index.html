@@ -1,0 +1,662 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Mémoires — Arbre Généalogique</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet"/>
+  <link rel="stylesheet" href="style.css"/>
+</head>
+<body>
+<div id="app">
+  <header id="header">
+    <div class="header-inner">
+      <a class="site-brand" href="index.html">
+        <span class="site-title">MÉMOIRES</span>
+        <span class="site-sub">Arbre généalogique</span>
+      </a>
+      <nav class="header-nav">
+        <a href="index.html"  class="nav-link active">Arbre</a>
+        <a href="saisie.html" class="nav-add">+ Ajouter</a>
+      </nav>
+      <div class="search-wrap">
+        <input id="search" type="text" placeholder="Rechercher…" autocomplete="off"/>
+        <ul id="search-results"></ul>
+      </div>
+      <div class="legend">
+        <span class="leg"><span class="leg-line parent"></span>Filiation</span>
+        <span class="leg"><span class="leg-line married"></span>Union</span>
+        <span class="leg"><span class="leg-line sibling"></span>Fratrie</span>
+      </div>
+    </div>
+  </header>
+
+  <div id="graph-container">
+    <svg id="graph"></svg>
+    <div id="zoom-btns">
+      <button id="btn-in">+</button>
+      <button id="btn-reset" style="font-size:.65rem">⌖</button>
+      <button id="btn-out">−</button>
+    </div>
+    <div id="loading-overlay">
+      <div class="spinner"></div>
+      <p>Chargement de l'arbre…</p>
+    </div>
+    <div id="empty-state">
+      <p>L'arbre est vide pour l'instant.</p>
+      <a href="saisie.html" class="btn-primary" style="margin-top:12px">Ajouter la première personne →</a>
+    </div>
+  </div>
+
+  <aside id="panel" class="panel-closed">
+    <button id="panel-close">✕</button>
+    <div id="panel-content"></div>
+  </aside>
+  <div id="overlay"></div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+<script type="module">
+  import { initializeApp }  from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+  import { getFirestore, collection, getDocs, query, orderBy }
+                            from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+  import { FIREBASE_CONFIG } from './firebase-config.js';
+
+  const app = initializeApp(FIREBASE_CONFIG);
+  const db  = getFirestore(app);
+  const $   = id => document.getElementById(id);
+
+  /* ══════════════════════════════════════
+     CONSTANTES
+  ══════════════════════════════════════ */
+  const R          = 27;    // rayon nœud
+  const NODE_FULL  = R * 2 + 20; // diamètre + label
+  const MIN_SPACE  = 130;   // espace minimal entre deux nœuds
+  const FAM_GAP    = 80;    // espace extra entre familles distinctes sur la même ligne
+  const ROW_H      = 150;   // hauteur entre lignes de génération
+  const PAD_T      = 55;    // padding haut
+  const PAD_L      = 80;    // padding gauche
+
+  const LINK_STYLE = {
+    parent:  { stroke:'#2b2b28', w:1.6, op:.50, dash:null  },
+    married: { stroke:'#8a8880', w:1.4, op:.45, dash:null  },
+    sibling: { stroke:'#c0beb6', w:1.2, op:.70, dash:'5,4' },
+  };
+
+  function getLabel(p, scale) {
+    const parts = p.name.split(' ');
+    if (scale > 0.85) return p.name;
+    if (scale > 0.52) return parts[0] + (parts[1] ? ' ' + parts[1][0] + '.' : '');
+    if (scale > 0.30) return parts[0];
+    return parts.map(w => w[0]).slice(0,2).join('').toUpperCase();
+  }
+
+  let allPersons = [], allLinks = [], svgSel, zoomGroup, zoomBeh, selectedId = null;
+
+  async function loadData() {
+    const [pSnap, lSnap] = await Promise.all([
+      getDocs(query(collection(db,'persons'), orderBy('name'))),
+      getDocs(collection(db,'links'))
+    ]);
+    allPersons = pSnap.docs.map(d => ({id: d.id, ...d.data()}));
+    allLinks   = lSnap.docs.map(d => ({id: d.id, ...d.data()}));
+    $('loading-overlay').style.display = 'none';
+    if (!allPersons.length) { $('empty-state').style.display = 'flex'; return; }
+    buildTree();
+    buildSearch();
+  }
+
+  function buildTree() {
+    const cont = $('graph-container');
+    const W = cont.clientWidth, H = cont.clientHeight;
+
+    /* ══════════════════════════════════════
+       ÉTAPE 1 — Construire le graphe de relations
+    ══════════════════════════════════════ */
+    const spouseOf    = {};   // id → id du conjoint
+    const parentsOf   = {};   // childId → [parentIds]
+    const childrenOf  = {};   // parentId → [childIds]
+
+    allLinks.forEach(l => {
+      if (l.type === 'married') {
+        spouseOf[l.source] = l.target;
+        spouseOf[l.target] = l.source;
+      }
+      if (l.type === 'parent') {
+        (childrenOf[l.source] = childrenOf[l.source] || []).push(l.target);
+        (parentsOf[l.target]  = parentsOf[l.target]  || []).push(l.source);
+      }
+    });
+
+    /* Enfants groupés par couple (clé symétrique triée) */
+    const coupleChildren = {}; // coupleKey → [childIds]
+    const childCouple    = {}; // childId → coupleKey
+
+    allPersons.forEach(child => {
+      const parents = parentsOf[child.id] || [];
+      if (!parents.length) return;
+      // Chercher la paire de parents (couple marié ou parent solo)
+      const p1 = parents[0];
+      const p2 = parents.length >= 2 ? parents[1] : (spouseOf[p1] && parents.indexOf(spouseOf[p1]) === -1 ? spouseOf[p1] : null);
+      const key = p2 ? [p1, p2].sort().join('|') : p1 + '|solo';
+      if (!coupleChildren[key]) coupleChildren[key] = [];
+      if (!coupleChildren[key].includes(child.id)) coupleChildren[key].push(child.id);
+      childCouple[child.id] = key;
+    });
+
+    // Trier les enfants de chaque couple par birthOrder puis birth
+    Object.keys(coupleChildren).forEach(key => {
+      coupleChildren[key].sort((a, b) => {
+        const pa = allPersons.find(x => x.id === a);
+        const pb = allPersons.find(x => x.id === b);
+        const oa = pa?.birthOrder ?? 999;
+        const ob = pb?.birthOrder ?? 999;
+        if (oa !== ob) return oa - ob;
+        return (pa?.birth || '').localeCompare(pb?.birth || '');
+      });
+    });
+
+    /* ══════════════════════════════════════
+       ÉTAPE 2 — Y par génération
+       La génération vient du champ "generation" de Firestore.
+       Gen max → ligne du haut, gen 1 → ligne du bas (ou inversé selon les données)
+       On détecte le sens : gen 1 = ancêtres (haut) ou gen 1 = enfants (bas) ?
+       Convention : gen 1 = ancêtres en haut → Y augmente avec la génération.
+    ══════════════════════════════════════ */
+    const genMin = Math.min(...allPersons.map(p => p.generation || 1));
+    const genMax = Math.max(...allPersons.map(p => p.generation || 1));
+
+    function genY(gen) {
+      // gen 1 (ancêtres) → haut, gen max (enfants) → bas
+      return PAD_T + (gen - genMin) * ROW_H + R;
+    }
+
+    /* ══════════════════════════════════════
+       ÉTAPE 3 — Calcul des positions X
+       Algorithme :
+       1. Pour chaque couple, calculer la largeur minimale de son groupe d'enfants
+       2. Affecter les X en partant des personnes sans parents (racines)
+       3. Centrer chaque couple sur ses enfants
+    ══════════════════════════════════════ */
+    const pos = {}; // id → {x, y}
+
+    // Largeur minimale du groupe d'enfants d'un couple
+    function childGroupWidth(coupleKey) {
+      const children = coupleChildren[coupleKey] || [];
+      if (!children.length) return 0;
+      return (children.length - 1) * MIN_SPACE;
+    }
+
+    // Pour chaque génération, collecter les "unités" à placer :
+    // une unité = un groupe d'enfants d'un même couple, séparé des autres
+    // On parcourt de la génération avec le plus d'enfants vers les autres
+
+    // Trouver toutes les personnes par génération
+    const byGen = {};
+    allPersons.forEach(p => {
+      const g = p.generation || 1;
+      (byGen[g] = byGen[g] || []).push(p);
+    });
+
+    // Identifier les familles à placer ligne par ligne
+    // Une "famille" sur une ligne = groupe d'enfants d'un même couple
+    // Les personnes sans parents sur cette ligne = isolées
+
+    // Collecter les familles (groupes d'enfants par couple) par génération cible
+    const familiesByGen = {}; // gen → [{coupleKey, children, centerX}]
+    Object.entries(coupleChildren).forEach(([key, children]) => {
+      if (!children.length) return;
+      const firstChild = allPersons.find(p => p.id === children[0]);
+      if (!firstChild) return;
+      const gen = firstChild.generation || 1;
+      if (!familiesByGen[gen]) familiesByGen[gen] = [];
+      familiesByGen[gen].push({ coupleKey: key, children });
+    });
+
+    // Calculer la largeur totale nécessaire pour chaque génération
+    // Pour placer les familles avec des espaces entre elles
+
+    // On commence par la génération la plus peuplée pour calibrer les espacements
+    // Puis on propage vers les autres générations
+
+    // Stratégie simplifiée mais robuste :
+    // 1. Placer chaque génération indépendamment, en répartissant les familles
+    // 2. Ensuite ajuster le X des parents pour être centrés sur leurs enfants
+
+    // Collecte de toutes les personnes isolées (sans parents) par gen
+    const lonelyByGen = {};
+    allPersons.forEach(p => {
+      const g = p.generation || 1;
+      const hasParentInData = (parentsOf[p.id] || []).some(pid => allPersons.find(x => x.id === pid));
+      if (!hasParentInData) {
+        (lonelyByGen[g] = lonelyByGen[g] || []).push(p.id);
+      }
+    });
+
+    // Phase 1 : placer la génération enfants (la plus profonde) en premier
+    const sortedGens = Object.keys(byGen).map(Number).sort((a,b) => a-b);
+
+    // Calculer la largeur de chaque génération
+    function genWidth(gen) {
+      const fams = familiesByGen[gen] || [];
+      const lonely = lonelyByGen[gen] || [];
+      const famsW = fams.reduce((s, f) => s + Math.max(childGroupWidth(f.coupleKey), 0) + MIN_SPACE, 0);
+      const lonelyW = lonely.length * MIN_SPACE;
+      const gaps = (fams.length + (lonely.length > 0 ? 1 : 0) - 1) * FAM_GAP;
+      return famsW + lonelyW + gaps;
+    }
+
+    const totalW = Math.max(...sortedGens.map(genWidth), W - PAD_L * 2) + PAD_L * 2;
+
+    // Placer chaque génération
+    sortedGens.forEach(gen => {
+      const y = genY(gen);
+      const fams = (familiesByGen[gen] || []).slice();
+      const lonely = (lonelyByGen[gen] || []).slice();
+
+      // Largeur totale de cette génération
+      const gw = genWidth(gen);
+      let curX = (totalW - gw) / 2 + PAD_L;
+
+      // Placer les familles
+      fams.forEach(fam => {
+        const children = fam.children;
+        const n = children.length;
+        // Les enfants sont espacés de MIN_SPACE
+        // Groupe centré sur curX + demi-largeur
+        const groupW = Math.max((n - 1) * MIN_SPACE, 0);
+        const groupStart = curX;
+
+        children.forEach((childId, i) => {
+          const x = n === 1 ? groupStart : groupStart + i * MIN_SPACE;
+          pos[childId] = { x, y };
+        });
+
+        curX += groupW + MIN_SPACE + FAM_GAP;
+      });
+
+      // Placer les personnes isolées
+      lonely.forEach(id => {
+        pos[id] = { x: curX, y };
+        curX += MIN_SPACE;
+      });
+    });
+
+    // Phase 2 : centrer les parents sur leurs enfants
+    // On remonte de la génération la plus profonde vers la plus haute
+    [...sortedGens].reverse().forEach(gen => {
+      // Pour chaque couple dont les enfants sont en gen, ajuster leur X
+      const fams = familiesByGen[gen] || [];
+      fams.forEach(fam => {
+        const children = fam.children;
+        const childXs = children.map(id => pos[id]?.x).filter(x => x !== undefined);
+        if (!childXs.length) return;
+
+        const centerX = (Math.min(...childXs) + Math.max(...childXs)) / 2;
+        const parts = fam.coupleKey.split('|');
+        const isSolo = parts[1] === 'solo';
+        const pA = parts[0];
+        const pB = isSolo ? null : parts[1];
+
+        const parentGen = (allPersons.find(p => p.id === pA)?.generation) || gen - 1;
+        const parentY   = genY(parentGen);
+
+        if (pB) {
+          // Couple : centré sur les enfants, A légèrement à gauche, B à droite
+          const halfGap = MIN_SPACE * 0.35;
+          pos[pA] = { x: centerX - halfGap, y: parentY };
+          pos[pB] = { x: centerX + halfGap, y: parentY };
+        } else {
+          pos[pA] = { x: centerX, y: parentY };
+        }
+      });
+    });
+
+    // Phase 3 : résoudre les conflits de position sur la même ligne
+    // (deux personnes trop proches → les écarter)
+    sortedGens.forEach(gen => {
+      const inGen = allPersons.filter(p => (p.generation||1) === gen && pos[p.id]);
+      inGen.sort((a,b) => pos[a.id].x - pos[b.id].x);
+      for (let i = 1; i < inGen.length; i++) {
+        const prev = pos[inGen[i-1].id];
+        const cur  = pos[inGen[i].id];
+        if (cur.x - prev.x < MIN_SPACE * 0.7) {
+          cur.x = prev.x + MIN_SPACE * 0.7;
+        }
+      }
+    });
+
+    /* ══════════════════════════════════════
+       ÉTAPE 4 — SVG + Tracé
+    ══════════════════════════════════════ */
+    const allX = Object.values(pos).map(p => p.x);
+    const allY = Object.values(pos).map(p => p.y);
+    const SVG_W = Math.max(W, Math.max(...allX) + PAD_L + 60);
+    const SVG_H = Math.max(H, Math.max(...allY) + NODE_FULL + 60);
+
+    svgSel = d3.select('#graph').attr('width', W).attr('height', H);
+    const defs = svgSel.append('defs');
+
+    allPersons.forEach(p => {
+      defs.append('clipPath').attr('id','clip-'+p.id).append('circle').attr('r', R);
+      if (p.mainPhoto) {
+        const pat = defs.append('pattern').attr('id','img-'+p.id)
+          .attr('patternContentUnits','objectBoundingBox').attr('width',1).attr('height',1);
+        pat.append('image').attr('href', p.mainPhoto)
+          .attr('width',1).attr('height',1).attr('preserveAspectRatio','xMidYMid slice');
+      }
+    });
+
+    const initK  = Math.min(1, (W - 60) / SVG_W);
+    const initTx = Math.max(0, (W - SVG_W * initK) / 2);
+    const startT = d3.zoomIdentity.translate(initTx, 16).scale(initK);
+
+    zoomGroup  = svgSel.append('g');
+    const lineG = zoomGroup.append('g');
+    const nodeG = zoomGroup.append('g');
+
+    /* ── UNIONS ── */
+    const drawnUnions = new Set();
+    allLinks.forEach(l => {
+      if (l.type !== 'married') return;
+      const key = [l.source, l.target].sort().join(',');
+      if (drawnUnions.has(key)) return;
+      drawnUnions.add(key);
+      const pa = pos[l.source], pb = pos[l.target];
+      if (!pa || !pb) return;
+      const s = LINK_STYLE.married;
+      lineG.append('line')
+        .attr('x1', Math.min(pa.x,pb.x) + R + 2).attr('y1', pa.y)
+        .attr('x2', Math.max(pa.x,pb.x) - R - 2).attr('y2', pa.y)
+        .attr('stroke',s.stroke).attr('stroke-width',s.w).attr('stroke-opacity',s.op);
+    });
+
+    /* ── FILIATIONS orthogonales ── */
+    Object.entries(coupleChildren).forEach(([coupleKey, childIds]) => {
+      const parts = coupleKey.split('|');
+      const isSolo = parts[1] === 'solo';
+      const pA = pos[parts[0]];
+      const pB = isSolo ? null : pos[parts[1]];
+      if (!pA) return;
+
+      const childPos = childIds.map(id => pos[id]).filter(Boolean);
+      if (!childPos.length) return;
+
+      const srcX  = pB ? (pA.x + pB.x) / 2 : pA.x;
+      const srcY  = pA.y; // centre du nœud parent
+      // Départ : juste sous le label du parent (centre + R + label + marge)
+      const startY = srcY + R + 18;
+      const childMinX = Math.min(...childPos.map(p => p.x));
+      const childMaxX = Math.max(...childPos.map(p => p.x));
+      const childY    = childPos[0].y;
+      const centerX   = (childMinX + childMaxX) / 2;
+      // Nœud intermédiaire à mi-chemin
+      const midY = startY + (childY - R - startY) * 0.5;
+
+      const s = LINK_STYLE.parent;
+
+      // Vertical parent → mid
+      lineG.append('line')
+        .attr('x1',srcX).attr('y1',startY)
+        .attr('x2',srcX).attr('y2',midY)
+        .attr('stroke',s.stroke).attr('stroke-width',s.w).attr('stroke-opacity',s.op);
+
+      // Horizontal vers le centre si décalé
+      if (Math.abs(srcX - centerX) > 3) {
+        lineG.append('line')
+          .attr('x1',srcX).attr('y1',midY)
+          .attr('x2',centerX).attr('y2',midY)
+          .attr('stroke',s.stroke).attr('stroke-width',s.w).attr('stroke-opacity',s.op);
+      }
+
+      // Barre horizontale couvrant tous les enfants
+      if (childIds.length > 1) {
+        lineG.append('line')
+          .attr('x1',childMinX).attr('y1',midY)
+          .attr('x2',childMaxX).attr('y2',midY)
+          .attr('stroke',s.stroke).attr('stroke-width',s.w).attr('stroke-opacity',s.op);
+      }
+
+      // Verticales vers chaque enfant (depuis mid → haut du cercle)
+      childPos.forEach(cp => {
+        lineG.append('line')
+          .attr('x1',cp.x).attr('y1',midY)
+          .attr('x2',cp.x).attr('y2',cp.y - R)
+          .attr('stroke',s.stroke).attr('stroke-width',s.w).attr('stroke-opacity',s.op);
+      });
+    });
+
+    /* ── FRATRIE ── */
+    const drawnFrat = new Set();
+    Object.entries(coupleChildren).forEach(([, siblings]) => {
+      if (siblings.length < 2) return;
+      const key = siblings.slice().sort().join(',');
+      if (drawnFrat.has(key)) return;
+      drawnFrat.add(key);
+      const positions = siblings.map(id => pos[id]).filter(Boolean);
+      if (positions.length < 2) return;
+      const minX  = Math.min(...positions.map(p => p.x));
+      const maxX  = Math.max(...positions.map(p => p.x));
+      // Sous les labels, pas sous les traits de filiation
+      const fratY = positions[0].y + R + 22;
+      const s = LINK_STYLE.sibling;
+      lineG.append('line')
+        .attr('x1',minX).attr('y1',fratY)
+        .attr('x2',maxX).attr('y2',fratY)
+        .attr('stroke',s.stroke).attr('stroke-width',s.w).attr('stroke-opacity',s.op)
+        .attr('stroke-dasharray',s.dash);
+    });
+
+    /* ── NŒUDS ── */
+    allPersons.forEach(p => {
+      const pt = pos[p.id]; if (!pt) return;
+      const g = nodeG.append('g')
+        .attr('transform',`translate(${pt.x},${pt.y})`)
+        .attr('id','node-'+p.id)
+        .style('cursor','pointer');
+
+      g.append('circle').attr('class','ring')
+        .attr('r',R+5).attr('fill','none')
+        .attr('stroke','#111110').attr('stroke-width',0).attr('opacity',0);
+
+      g.append('circle').attr('r',R)
+        .attr('fill', p.mainPhoto ? `url(#img-${p.id})` : '#f0efed')
+        .attr('stroke','rgba(255,255,255,0.85)').attr('stroke-width',2)
+        .style('filter','drop-shadow(3px 3px 6px rgba(0,0,0,0.09)) drop-shadow(-2px -2px 4px rgba(255,255,255,0.70))');
+
+      if (!p.mainPhoto) {
+        const parts = p.name.split(' ');
+        const ini = parts.map(w => w[0]).slice(0,2).join('').toUpperCase();
+        g.append('text').attr('text-anchor','middle').attr('dominant-baseline','central')
+          .attr('font-size','11px').attr('font-weight','600')
+          .attr('fill','#47463f').attr('pointer-events','none').text(ini);
+      }
+
+      g.append('text').attr('class','lbl').attr('data-id',p.id)
+        .attr('y',R+14).attr('text-anchor','middle')
+        .attr('font-family','-apple-system,Helvetica Neue,sans-serif')
+        .attr('font-size','11px').attr('font-weight','500')
+        .attr('fill','#47463f').attr('pointer-events','none');
+
+      if (p.birthOrder) {
+        g.append('circle').attr('cx',R-4).attr('cy',-R+4).attr('r',8)
+          .attr('fill','#e8e7e4').attr('stroke','#d0ceca').attr('stroke-width',1);
+        g.append('text').attr('x',R-4).attr('y',-R+4)
+          .attr('text-anchor','middle').attr('dominant-baseline','central')
+          .attr('font-size','8px').attr('font-weight','700')
+          .attr('fill','#8a8880').attr('pointer-events','none')
+          .text(p.birthOrder);
+      }
+
+      g.on('mouseenter', function() {
+          d3.select(this).select('.ring').attr('stroke-width',2.5).attr('opacity',.22);
+        })
+        .on('mouseleave', function() {
+          if (selectedId !== p.id)
+            d3.select(this).select('.ring').attr('stroke-width',0).attr('opacity',0);
+        })
+        .on('click', e => { e.stopPropagation(); openPanel(p.id); });
+    });
+
+    /* ── ZOOM ── */
+    zoomBeh = d3.zoom().scaleExtent([0.08,3]).on('zoom', e => {
+      zoomGroup.attr('transform', e.transform);
+      updateLabels(e.transform.k * initK);
+    });
+    svgSel.call(zoomBeh).on('dblclick.zoom',null);
+    svgSel.call(zoomBeh.transform, startT);
+    svgSel.on('click', closePanel);
+    updateLabels(initK);
+
+    $('btn-in').onclick    = () => svgSel.transition().duration(280).call(zoomBeh.scaleBy, 1.5);
+    $('btn-out').onclick   = () => svgSel.transition().duration(280).call(zoomBeh.scaleBy, 0.67);
+    $('btn-reset').onclick = () => svgSel.transition().duration(450).call(zoomBeh.transform, startT);
+    window.addEventListener('resize', () => {
+      svgSel.attr('width',cont.clientWidth).attr('height',cont.clientHeight);
+    });
+  }
+
+  function updateLabels(scale) {
+    d3.selectAll('.lbl').each(function() {
+      const id = d3.select(this).attr('data-id');
+      const p  = allPersons.find(x => x.id === id);
+      if (p) d3.select(this).text(getLabel(p, scale));
+    });
+  }
+
+  /* ══════════════════════════════════════
+     PANEL
+  ══════════════════════════════════════ */
+  function calcAge(birth, death) {
+    if (!birth) return null;
+    const m = String(birth).match(/\d{4}/);
+    if (!m) return null;
+    const by = parseInt(m[0]);
+    const dm = death ? String(death).match(/\d{4}/) : null;
+    const ey = dm ? parseInt(dm[0]) : new Date().getFullYear();
+    return ey - by;
+  }
+
+  function fratrieLabel(rank, total) {
+    if (total <= 1) return null;
+    if (rank === 1) return "Aîné(e)";
+    if (rank === total) return "Benjamin(e)";
+    return "Cadet(te)";
+  }
+
+  function personSVG(filled) {
+    const col = filled ? "#111110" : "none";
+    const str = filled ? "none" : "#c0beb6";
+    const sw  = filled ? 0 : 1.5;
+    return `<svg width="18" height="18" viewBox="0 0 20 20" fill="none">
+      <circle cx="10" cy="6.5" r="3.5" fill="${col}" stroke="${str}" stroke-width="${sw}"/>
+      <path d="M3 17.5C3 14.186 6.134 11.5 10 11.5s7 2.686 7 6" stroke="${filled?"#111110":str}" stroke-width="${filled?1.5:sw}" stroke-linecap="round" fill="${col}"/>
+    </svg>`;
+  }
+
+  function openPanel(id) {
+    const p = allPersons.find(x => x.id === id); if (!p) return;
+    if (selectedId) unhighlight(selectedId);
+    selectedId = id; highlight(id);
+
+    const parts = p.name.split(' ');
+    const firstName = parts[0];
+    const lastName  = parts.slice(1).join(' ');
+
+    const photo = p.mainPhoto
+      ? `<div class="panel-photo-wrap"><img src="${p.mainPhoto}" alt="${p.name}" loading="lazy"/></div>`
+      : `<div class="panel-photo-empty"><div class="panel-photo-avatar">${parts.map(w=>w[0]).slice(0,2).join("").toUpperCase()}</div></div>`;
+
+    const maidenHTML = p.nomJeuneFille ? `<div class="panel-maiden">née ${p.nomJeuneFille}</div>` : "";
+
+    const age = calcAge(p.birth, p.death);
+    const ageHTML = age ? `<span class="pill-age">${age} ans</span>` : "";
+
+    const dateParts = [p.birth ? `✦ ${p.birth}` : "", p.death ? `† ${p.death}` : ""].filter(Boolean);
+    const datesHTML = dateParts.length ? `<span class="pill-dates">${dateParts.join(" · ")}</span>` : "";
+
+    let fratrieHTML = "";
+    if (p.birthOrder) {
+      const sibCount = allLinks.filter(l => {
+        const s = l.source?.id||l.source, t = l.target?.id||l.target;
+        return l.type === "sibling" && (s === id || t === id);
+      }).length;
+      const total = sibCount + 1;
+      const lbl = fratrieLabel(p.birthOrder, total);
+      if (lbl) {
+        let pictos = "";
+        for (let i = 1; i <= total; i++) pictos += personSVG(i === p.birthOrder);
+        const ord = p.birthOrder === 1 ? "1ᵉʳ" : `${p.birthOrder}ᵉ`;
+        fratrieHTML = `<div class="panel-fratrie">
+          <div class="panel-fratrie-pictos">${pictos}</div>
+          <div><span class="panel-fratrie-label">${lbl}</span><span class="panel-fratrie-sub">${ord} enfant sur ${total}</span></div>
+        </div>`;
+      }
+    }
+
+    const infoRows = [];
+    if (p.birthPlace) infoRows.push(`<div class="panel-info-row"><span class="panel-info-label">Lieu de naissance</span><span class="panel-info-value">${p.birthPlace}</span></div>`);
+    const infoHTML = infoRows.length ? `<div class="panel-info-bloc">${infoRows.join("")}</div><hr class="panel-div"/>` : "";
+
+    let galleryHTML = "";
+    if (p.photos && p.photos.length > 1) {
+      const extras = p.photos.filter(u => u !== p.mainPhoto);
+      if (extras.length) galleryHTML = `<hr class="panel-div"/><div class="panel-gallery-bloc"><div class="panel-gallery-label">Photos</div><div class="panel-gallery">${extras.map(u=>`<img src="${u}" alt="" loading="lazy"/>`).join("")}</div></div>`;
+    }
+
+    $('panel-content').innerHTML = `
+      ${photo}
+      <div class="panel-identity">
+        <div class="panel-firstname">${firstName}</div>
+        <div class="panel-lastname">${lastName || firstName}</div>
+        ${maidenHTML}
+        <div class="panel-pills">${ageHTML}${datesHTML}</div>
+        ${fratrieHTML}
+      </div>
+      <hr class="panel-div"/>
+      ${infoHTML}
+      <div class="panel-bio-bloc">
+        <div class="panel-bio-label">Biographie</div>
+        <p class="panel-bio">${p.bio || '<span style="opacity:.4;font-style:italic">Aucune biographie.</span>'}</p>
+      </div>
+      ${galleryHTML}
+      <div class="panel-edit-wrap"><a href="saisie.html?edit=${id}" class="btn-edit">✎ Modifier cette fiche</a></div>
+    `;
+
+    $('panel').classList.add('panel-open');
+    $('panel').classList.remove('panel-closed');
+    $('overlay').classList.add('visible');
+  }
+
+  function closePanel() {
+    $('panel').className='panel-closed';
+    $('overlay').classList.remove('visible');
+    if (selectedId) { unhighlight(selectedId); selectedId=null; }
+  }
+  function highlight(id)   { d3.select('#node-'+id).select('.ring').attr('stroke-width',3).attr('opacity',.3); }
+  function unhighlight(id) { d3.select('#node-'+id).select('.ring').attr('stroke-width',0).attr('opacity',0); }
+
+  function buildSearch() {
+    const inp=$('search'), res=$('search-results');
+    inp.addEventListener('input', () => {
+      const q=inp.value.trim().toLowerCase(); res.innerHTML='';
+      if (!q) { res.className=''; return; }
+      const m=allPersons.filter(p=>p.name.toLowerCase().includes(q)).slice(0,8);
+      if (!m.length) { res.className=''; return; }
+      m.forEach(p => {
+        const li=document.createElement('li'); li.textContent=p.name;
+        li.onclick=()=>{ openPanel(p.id); inp.value=''; res.className=''; };
+        res.appendChild(li);
+      });
+      res.className='visible';
+    });
+    document.addEventListener('click', e => { if (!e.target.closest('.search-wrap')) res.className=''; });
+  }
+
+  $('panel-close').onclick = e => { e.stopPropagation(); closePanel(); };
+  $('overlay').onclick = closePanel;
+  loadData();
+</script>
+</body>
+</html>
