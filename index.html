@@ -1,0 +1,663 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Mémoires — Arbre Généalogique</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet"/>
+  <link rel="stylesheet" href="style.css"/>
+</head>
+<body>
+<div id="app">
+  <header id="header">
+    <div class="header-inner">
+      <a class="site-brand" href="index.html">
+        <span class="site-title">MÉMOIRES</span>
+        <span class="site-sub">Arbre généalogique</span>
+      </a>
+      <nav class="header-nav">
+        <a href="index.html" class="nav-link active">Arbre</a>
+        <a href="saisie.html" class="nav-add">+ Ajouter</a>
+      </nav>
+      <div class="search-wrap">
+        <input id="search" type="text" placeholder="Rechercher…" autocomplete="off"/>
+        <ul id="search-results"></ul>
+      </div>
+      <div class="legend">
+        <span class="leg"><span class="leg-line parent"></span>Filiation</span>
+        <span class="leg"><span class="leg-union">●</span>Union</span>
+        <span class="leg"><span class="leg-line sibling"></span>Fratrie</span>
+      </div>
+    </div>
+  </header>
+  <div id="graph-container">
+    <svg id="graph"></svg>
+    <div id="zoom-btns">
+      <button id="btn-in">+</button>
+      <button id="btn-reset" style="font-size:.65rem">⌖</button>
+      <button id="btn-out">−</button>
+    </div>
+    <div id="loading-overlay"><div class="spinner"></div><p>Chargement…</p></div>
+    <div id="empty-state">
+      <p>L'arbre est vide.</p>
+      <a href="saisie.html" class="btn-primary" style="margin-top:12px">Ajouter la première personne →</a>
+    </div>
+  </div>
+  <aside id="panel" class="panel-closed">
+    <button id="panel-close">✕</button>
+    <div id="panel-content"></div>
+  </aside>
+  <div id="overlay"></div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+<script type="module">
+import { initializeApp }  from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import { getFirestore, collection, getDocs, query, orderBy }
+                          from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+import { FIREBASE_CONFIG } from './firebase-config.js';
+
+const app = initializeApp(FIREBASE_CONFIG);
+const db  = getFirestore(app);
+const $   = id => document.getElementById(id);
+
+/* ══════════════════════════════════════
+   CONSTANTES
+══════════════════════════════════════ */
+const R         = 26;
+const UR        = 6;
+const SP_FULL   = 140;  // espace entre frères/sœurs full
+const SP_DIM    = 70;   // espace condensé pour branches grisées
+const CONJ_GAP  = 90;   // distance entre conjoints (de centre à centre)
+const FAM_GAP   = 80;   // gap entre familles distinctes
+const ROW_H     = 160;
+const PAD_T     = 60;
+
+let allPersons = [], allLinks = [];
+let svgSel, zoomGroup, zoomBeh;
+let focusId    = null;
+let expanded   = new Set(); // ids des branches "•••" déployées
+let currentTransform = d3.zoomIdentity;
+
+/* ══════════════════════════════════════
+   CHARGEMENT
+══════════════════════════════════════ */
+async function loadData() {
+  const [pS,lS] = await Promise.all([
+    getDocs(query(collection(db,'persons'), orderBy('name'))),
+    getDocs(collection(db,'links'))
+  ]);
+  allPersons = pS.docs.map(d => ({id:d.id,...d.data()}));
+  allLinks   = lS.docs.map(d => ({id:d.id,...d.data()}));
+  $('loading-overlay').style.display = 'none';
+  if (!allPersons.length) { $('empty-state').style.display='flex'; return; }
+  buildSearch();
+  const last = localStorage.getItem('memoires-focus');
+  focusId = (last && allPersons.find(p=>p.id===last)) ? last : findRoot();
+  renderTree(true);
+}
+
+function findRoot() {
+  const hasParent = new Set(allLinks.filter(l=>l.type==='parent').map(l=>l.target));
+  const roots = allPersons.filter(p=>!hasParent.has(p.id));
+  roots.sort((a,b)=>(a.generation||5)-(b.generation||5));
+  return roots[0]?.id || allPersons[0]?.id;
+}
+
+/* ══════════════════════════════════════
+   CONSTRUCTION DE LA SCÈNE
+   
+   "dim" = grisé (branche latérale non déployée)
+   "full" = en plein (ancêtres directs + leurs conjoints + focus + descendants directs)
+══════════════════════════════════════ */
+function buildScene() {
+  const pMap = {};
+  allPersons.forEach(p => pMap[p.id] = p);
+
+  const parentsOf  = {};
+  const childrenOf = {};
+  const spouseOf   = {};
+  allLinks.forEach(l => {
+    if (l.type==='parent') {
+      (parentsOf[l.target]  = parentsOf[l.target]  || []).push(l.source);
+      (childrenOf[l.source] = childrenOf[l.source] || []).push(l.target);
+    }
+    if (l.type==='married') {
+      spouseOf[l.source] = l.target;
+      spouseOf[l.target] = l.source;
+    }
+  });
+
+  /* Ancêtres directs du focus (la "colonne vertébrale") */
+  const backbone = new Set(); // ids sur la ligne directe focus → racines
+  function collectBackbone(id) {
+    backbone.add(id);
+    (parentsOf[id]||[]).forEach(pid => collectBackbone(pid));
+  }
+  collectBackbone(focusId);
+
+  /* Pour chaque personne backbone, son conjoint est aussi backbone */
+  [...backbone].forEach(id => {
+    const sp = spouseOf[id];
+    if (sp) backbone.add(sp);
+  });
+
+  /* Descendants directs du focus */
+  const descFull = new Set();
+  function collectDesc(id) {
+    descFull.add(id);
+    const sp = spouseOf[id]; if (sp) descFull.add(sp);
+    (childrenOf[id]||[]).forEach(cid => collectDesc(cid));
+  }
+  collectDesc(focusId);
+
+  /* Frères/sœurs du focus → full */
+  (parentsOf[focusId]||[]).forEach(pid => {
+    (childrenOf[pid]||[]).forEach(sid => {
+      descFull.add(sid);
+      const sp = spouseOf[sid]; if (sp) descFull.add(sp);
+    });
+  });
+
+  /* Frères/sœurs des backbone (pas le backbone lui-même) → dim
+     SAUF si dans expanded → full + leurs enfants */
+  const nodes = new Map(); // id → {person, dim, hasDimChildren, expandedBranch}
+
+  const addNode = (id, dim) => {
+    if (!pMap[id]) return;
+    if (!nodes.has(id)) nodes.set(id, {person:pMap[id], dim, hasDimChildren:false});
+    else if (!dim) nodes.get(id).dim = false;
+  };
+
+  backbone.forEach(id  => addNode(id, false));
+  descFull.forEach(id  => addNode(id, false));
+
+  /* Frères/sœurs de chaque backbone */
+  backbone.forEach(bId => {
+    if (descFull.has(bId)) return;
+    (parentsOf[bId]||[]).forEach(pid => {
+      (childrenOf[pid]||[]).forEach(sid => {
+        if (backbone.has(sid)) return;
+        const isExpanded = expanded.has(sid);
+        addNode(sid, !isExpanded);
+        const sp = spouseOf[sid]; if (sp) addNode(sp, !isExpanded);
+        /* Si expanded, ajouter aussi ses descendants */
+        if (isExpanded) {
+          function addExpandedDesc(eid) {
+            addNode(eid, false);
+            const esp = spouseOf[eid]; if (esp) addNode(esp, false);
+            (childrenOf[eid]||[]).forEach(cid => addExpandedDesc(cid));
+          }
+          addExpandedDesc(sid);
+        }
+        /* Marquer hasDimChildren si a des enfants */
+        if (!isExpanded && (childrenOf[sid]||[]).length > 0) {
+          const n = nodes.get(sid); if (n) n.hasDimChildren = true;
+        }
+      });
+    });
+  });
+
+  return { nodes, parentsOf, childrenOf, spouseOf, pMap };
+}
+
+/* ══════════════════════════════════════
+   PLACEMENT
+   
+   Algorithme par génération :
+   Pour chaque génération, on groupe les personnes par "unité familiale" :
+   - Une unité = [conjoint_gauche?, personne, conjoint_droit?] + leurs enfants centrés dessous
+   - Les frères/sœurs sont placés à l'extérieur des unités, avec SP_DIM si dim
+   - Les ancêtres du conjoint (lignée étrangère) se placent du côté du conjoint
+══════════════════════════════════════ */
+function computeLayout(scene) {
+  const {nodes, parentsOf, childrenOf, spouseOf, pMap} = scene;
+  const visIds = [...nodes.keys()];
+
+  /* Couples visibles → enfants visibles */
+  const coupleChildren = {};
+  visIds.forEach(cid => {
+    const parents = (parentsOf[cid]||[]).filter(pid => nodes.has(pid));
+    if (!parents.length) return;
+    const p1 = parents[0];
+    const sp = spouseOf[p1];
+    const p2 = (sp && nodes.has(sp)) ? sp : null;
+    const key = p2 ? [p1,p2].sort().join('|') : p1+'|solo';
+    if (!coupleChildren[key]) coupleChildren[key] = [];
+    if (!coupleChildren[key].includes(cid)) coupleChildren[key].push(cid);
+  });
+
+  /* Tri des enfants par birthOrder */
+  Object.keys(coupleChildren).forEach(k => {
+    coupleChildren[k].sort((a,b) => {
+      const pa=pMap[a], pb=pMap[b];
+      return ((pa?.birthOrder||999)-(pb?.birthOrder||999)) ||
+             ((pa?.birth||'').localeCompare(pb?.birth||''));
+    });
+  });
+
+  const genMin = Math.min(...visIds.map(id => nodes.get(id)?.person?.generation||1));
+  const genY   = g => PAD_T + (g-genMin)*ROW_H + R;
+
+  /* Familles et solitaires par génération */
+  const famsByGen  = {};
+  const lonelyByGen = {};
+  Object.entries(coupleChildren).forEach(([key,children]) => {
+    if (!children.length) return;
+    const g = nodes.get(children[0])?.person?.generation || 1;
+    (famsByGen[g] = famsByGen[g]||[]).push({key, children});
+  });
+  visIds.forEach(id => {
+    const hasFam = Object.values(coupleChildren).some(ch => ch.includes(id));
+    if (!hasFam) {
+      const g = nodes.get(id)?.person?.generation || 1;
+      (lonelyByGen[g] = lonelyByGen[g]||[]).push(id);
+    }
+  });
+
+  const sortedGens = [...new Set(visIds.map(id=>nodes.get(id)?.person?.generation||1))].sort((a,b)=>a-b);
+
+  /* Largeur d'une famille selon que ses membres sont dim ou full */
+  function famW(fam) {
+    const children = fam.children;
+    if (!children.length) return SP_FULL;
+    const dimCount  = children.filter(id => nodes.get(id)?.dim).length;
+    const fullCount = children.length - dimCount;
+    return Math.max(
+      (fullCount-1)*SP_FULL + dimCount*SP_DIM,
+      0
+    ) + SP_FULL;
+  }
+
+  function genTW(gen) {
+    const fams  = famsByGen[gen]  || [];
+    const lones = lonelyByGen[gen]|| [];
+    let w = 0;
+    fams.forEach((f,i) => { w += famW(f); if(i<fams.length-1) w+=FAM_GAP; });
+    if (lones.length) w += (lones.length-1)*SP_DIM + SP_FULL + (fams.length?FAM_GAP:0);
+    return w;
+  }
+
+  const totalW = Math.max(...sortedGens.map(genTW), 500) + 200;
+  const pos = {};
+
+  /* Phase 1 : poser les enfants de chaque famille */
+  sortedGens.forEach(gen => {
+    const y    = genY(gen);
+    const fams = famsByGen[gen]  || [];
+    const lones= lonelyByGen[gen]|| [];
+    const gw   = genTW(gen);
+    let curX   = (totalW-gw)/2;
+
+    fams.forEach((fam,fi) => {
+      const children = fam.children;
+      let x = curX;
+      children.forEach((id,i) => {
+        pos[id] = { x, y };
+        const isDim = nodes.get(id)?.dim;
+        x += i<children.length-1 ? (isDim ? SP_DIM : SP_FULL) : 0;
+      });
+      curX += famW(fam) + (fi<fams.length-1 ? FAM_GAP : 0);
+    });
+
+    if (lones.length) {
+      if (fams.length) curX += FAM_GAP;
+      lones.forEach((id,i) => {
+        const isDim = nodes.get(id)?.dim;
+        pos[id] = { x: curX, y };
+        curX += isDim ? SP_DIM : SP_FULL;
+      });
+    }
+  });
+
+  /* Phase 2 : centrer chaque couple sur ses enfants,
+     puis placer le conjoint adjacent et les frères/sœurs à l'extérieur */
+  [...sortedGens].reverse().forEach(gen => {
+    (famsByGen[gen]||[]).forEach(fam => {
+      const xs = fam.children.map(id=>pos[id]?.x).filter(x=>x!==undefined);
+      if (!xs.length) return;
+      const cx  = (Math.min(...xs)+Math.max(...xs))/2;
+      const parts = fam.key.split('|');
+      const isSolo = parts[1]==='solo';
+      const pAid = parts[0], pBid = isSolo?null:parts[1];
+      const pAgen = nodes.get(pAid)?.person?.generation || (gen-1);
+      const py    = genY(pAgen);
+
+      if (pBid && nodes.has(pBid)) {
+        /* Le conjoint est adjacent au centre :
+           - La personne backbone est du côté "intérieur"
+           - Le conjoint est immédiatement à côté */
+        const halfGap = CONJ_GAP / 2;
+        pos[pAid] = { x: cx - halfGap, y: py };
+        pos[pBid] = { x: cx + halfGap, y: py };
+      } else {
+        pos[pAid] = { x: cx, y: py };
+      }
+    });
+  });
+
+  /* Phase 3 : anti-collision sur chaque ligne */
+  sortedGens.forEach(gen => {
+    const inGen = visIds
+      .filter(id => (nodes.get(id)?.person?.generation||1)===gen && pos[id])
+      .sort((a,b) => pos[a].x - pos[b].x);
+    for (let i=1; i<inGen.length; i++) {
+      const prev = pos[inGen[i-1]];
+      const cur  = pos[inGen[i]];
+      const minDist = nodes.get(inGen[i])?.dim ? SP_DIM*0.6 : SP_FULL*0.7;
+      if (cur.x - prev.x < minDist) cur.x = prev.x + minDist;
+    }
+  });
+
+  /* Nœuds union ● au centre de chaque couple */
+  const unionNodes = {};
+  Object.entries(coupleChildren).forEach(([key]) => {
+    const parts = key.split('|'); const isSolo = parts[1]==='solo';
+    const pA = pos[parts[0]]; const pB = isSolo?null:pos[parts[1]];
+    if (!pA) return;
+    unionNodes[key] = { x: pB?(pA.x+pB.x)/2:pA.x, y: pA.y };
+  });
+
+  return { pos, unionNodes, coupleChildren, totalW, genY };
+}
+
+/* ══════════════════════════════════════
+   RENDU SVG
+══════════════════════════════════════ */
+function renderTree(firstLoad=false) {
+  localStorage.setItem('memoires-focus', focusId);
+
+  const cont = $('graph-container');
+  const W = cont.clientWidth, H = cont.clientHeight;
+
+  const scene  = buildScene();
+  const layout = computeLayout(scene);
+  const { pos, unionNodes, coupleChildren } = layout;
+  const { nodes, pMap } = scene;
+  const visIds = [...nodes.keys()];
+
+  /* Sauvegarder la transform courante avant de tout reconstruire */
+  const savedTransform = currentTransform;
+
+  if (svgSel) svgSel.selectAll('*').remove();
+  else svgSel = d3.select('#graph').attr('width',W).attr('height',H);
+
+  svgSel.attr('width',W).attr('height',H);
+  const defs = svgSel.append('defs');
+
+  visIds.forEach(id => {
+    const p = pMap[id]; if (!p) return;
+    defs.append('clipPath').attr('id','clip-'+id).append('circle').attr('r',R);
+    if (p.mainPhoto) {
+      const pat = defs.append('pattern').attr('id','img-'+id)
+        .attr('patternContentUnits','objectBoundingBox').attr('width',1).attr('height',1);
+      pat.append('image').attr('href',p.mainPhoto).attr('width',1).attr('height',1)
+        .attr('preserveAspectRatio','xMidYMid slice');
+    }
+  });
+
+  /* Zoom initial : centré sur focusId au premier chargement,
+     sinon on restaure la transform sauvegardée */
+  const focusPt = pos[focusId];
+  let startT;
+  if (firstLoad && focusPt) {
+    const initK = Math.min(1, (W-60) / (layout.totalW+100));
+    const tx = W/2 - focusPt.x*initK;
+    const ty = H/2 - focusPt.y*initK;
+    startT = d3.zoomIdentity.translate(tx,ty).scale(initK);
+  } else {
+    startT = savedTransform;
+  }
+
+  zoomGroup = svgSel.append('g');
+  const lineG = zoomGroup.append('g');
+  const nodeG = zoomGroup.append('g');
+
+  /* ── TRAITS ── */
+  Object.entries(coupleChildren).forEach(([key,childIds]) => {
+    const parts  = key.split('|'); const isSolo = parts[1]==='solo';
+    const pA = pos[parts[0]], pB = isSolo?null:pos[parts[1]];
+    const un = unionNodes[key];
+    if (!pA || !un) return;
+
+    const isDim = nodes.get(parts[0])?.dim;
+    const op    = isDim ? 0.22 : 0.52;
+
+    /* Trait d'union horizontal entre les deux parents */
+    if (pB) {
+      const lx = Math.min(pA.x,pB.x)+R+2;
+      const rx = Math.max(pA.x,pB.x)-R-2;
+      if (rx > lx)
+        lineG.append('line')
+          .attr('x1',lx).attr('y1',pA.y).attr('x2',rx).attr('y2',pA.y)
+          .attr('stroke','#2b2b28').attr('stroke-width',1.6).attr('stroke-opacity',op);
+    }
+
+    const childPos = childIds.map(id=>pos[id]).filter(Boolean);
+    if (!childPos.length) return;
+
+    const cMinX = Math.min(...childPos.map(p=>p.x));
+    const cMaxX = Math.max(...childPos.map(p=>p.x));
+    const childY= childPos[0].y;
+    const cx    = (cMinX+cMaxX)/2;
+    const startY= un.y+UR+4;
+    const midY  = startY + (childY-R-startY)*0.48;
+
+    lineG.append('line').attr('x1',un.x).attr('y1',startY).attr('x2',un.x).attr('y2',midY)
+      .attr('stroke','#2b2b28').attr('stroke-width',1.6).attr('stroke-opacity',op);
+    if (Math.abs(un.x-cx)>3)
+      lineG.append('line').attr('x1',un.x).attr('y1',midY).attr('x2',cx).attr('y2',midY)
+        .attr('stroke','#2b2b28').attr('stroke-width',1.6).attr('stroke-opacity',op);
+    if (childIds.length>1)
+      lineG.append('line').attr('x1',cMinX).attr('y1',midY).attr('x2',cMaxX).attr('y2',midY)
+        .attr('stroke','#2b2b28').attr('stroke-width',1.6).attr('stroke-opacity',op);
+    childPos.forEach(cp => {
+      lineG.append('line').attr('x1',cp.x).attr('y1',midY).attr('x2',cp.x).attr('y2',cp.y-R)
+        .attr('stroke','#2b2b28').attr('stroke-width',1.6).attr('stroke-opacity',op);
+    });
+  });
+
+  /* Fratrie pointillée — uniquement entre frères full dans la même famille */
+  const drawnF = new Set();
+  Object.entries(coupleChildren).forEach(([,sibs]) => {
+    const fullSibs = sibs.filter(id => !nodes.get(id)?.dim);
+    if (fullSibs.length<2) return;
+    const key = fullSibs.slice().sort().join(',');
+    if (drawnF.has(key)) return; drawnF.add(key);
+    const positions = fullSibs.map(id=>pos[id]).filter(Boolean);
+    if (positions.length<2) return;
+    const minX  = Math.min(...positions.map(p=>p.x));
+    const maxX  = Math.max(...positions.map(p=>p.x));
+    const fratY = positions[0].y+R+22;
+    lineG.append('line').attr('x1',minX).attr('y1',fratY).attr('x2',maxX).attr('y2',fratY)
+      .attr('stroke','#c0beb6').attr('stroke-width',1.2).attr('stroke-opacity',.7)
+      .attr('stroke-dasharray','5,4');
+  });
+
+  /* ── NŒUDS UNION ● ── */
+  Object.entries(unionNodes).forEach(([key,un]) => {
+    const isDim = nodes.get(key.split('|')[0])?.dim;
+    const op    = isDim ? 0.22 : 1;
+    nodeG.append('circle').attr('cx',un.x).attr('cy',un.y).attr('r',UR+3)
+      .attr('fill','#f0efed').attr('opacity',op);
+    nodeG.append('circle').attr('cx',un.x).attr('cy',un.y).attr('r',UR)
+      .attr('fill','#2b2b28').attr('opacity',op);
+  });
+
+  /* ── NŒUDS PERSONNES ── */
+  visIds.forEach(id => {
+    const nd = nodes.get(id); if (!nd) return;
+    const pt = pos[id]; if (!pt) return;
+    const { person:p, dim, hasDimChildren } = nd;
+    const isFocus = id===focusId;
+
+    const g = nodeG.append('g')
+      .attr('transform',`translate(${pt.x},${pt.y})`)
+      .attr('id','node-'+id)
+      .attr('opacity', dim?0.32:1)
+      .style('cursor','pointer');
+
+    if (isFocus)
+      g.append('circle').attr('r',R+7).attr('fill','none')
+        .attr('stroke','#111110').attr('stroke-width',2).attr('opacity',.15);
+
+    g.append('circle').attr('class','ring').attr('r',R+5).attr('fill','none')
+      .attr('stroke','#111110').attr('stroke-width',0).attr('opacity',0);
+    g.append('circle').attr('r',R)
+      .attr('fill', p.mainPhoto?`url(#img-${id})`:'#f0efed')
+      .attr('stroke', isFocus?'#111110':'rgba(255,255,255,0.85)')
+      .attr('stroke-width', isFocus?2.5:2)
+      .style('filter','drop-shadow(3px 3px 6px rgba(0,0,0,0.09)) drop-shadow(-2px -2px 4px rgba(255,255,255,0.70))');
+
+    if (!p.mainPhoto) {
+      const pts = p.name.split(' ');
+      g.append('text').attr('text-anchor','middle').attr('dominant-baseline','central')
+        .attr('font-size','11px').attr('font-weight',isFocus?'700':'600')
+        .attr('fill',isFocus?'#111110':'#47463f').attr('pointer-events','none')
+        .text(pts.map(w=>w[0]).slice(0,2).join('').toUpperCase());
+    }
+
+    g.append('text').attr('class','lbl').attr('data-id',id)
+      .attr('y',R+14).attr('text-anchor','middle')
+      .attr('font-size','11px').attr('font-weight',isFocus?'700':'500')
+      .attr('fill',isFocus?'#111110':'#47463f').attr('pointer-events','none');
+
+    /* Bouton "•••" pour les branches dim avec enfants */
+    if (hasDimChildren && dim) {
+      const dotY = pt.y+R+38;
+      const dotG = nodeG.append('g')
+        .attr('transform',`translate(${pt.x},${dotY})`)
+        .attr('opacity',.55)
+        .style('cursor','pointer');
+      dotG.append('rect').attr('x',-18).attr('y',-11).attr('width',36).attr('height',22)
+        .attr('rx',11).attr('fill','#e8e7e4').attr('stroke','#c8c6c2').attr('stroke-width',1);
+      dotG.append('text').attr('text-anchor','middle').attr('dominant-baseline','central')
+        .attr('font-size','12px').attr('fill','#7a7974').attr('letter-spacing','2px')
+        .attr('pointer-events','none').text('•••');
+      dotG.on('click', e => {
+        e.stopPropagation();
+        if (expanded.has(id)) expanded.delete(id);
+        else expanded.add(id);
+        renderTree(false); // ne pas bouger la vue
+      });
+    }
+
+    g.on('mouseenter', function() {
+        if (!dim) d3.select(this).select('.ring').attr('stroke-width',2.5).attr('opacity',.22);
+      })
+      .on('mouseleave', function() {
+        d3.select(this).select('.ring').attr('stroke-width',0).attr('opacity',0);
+      })
+      .on('click', e => {
+        e.stopPropagation();
+        if (id===focusId) {
+          openPanel(id);
+        } else {
+          closePanel();
+          focusId = id;
+          expanded.clear();
+          renderTree(true);
+        }
+      });
+  });
+
+  /* ── ZOOM ── */
+  if (!zoomBeh) {
+    zoomBeh = d3.zoom().scaleExtent([0.06,3]).on('zoom', e => {
+      currentTransform = e.transform;
+      zoomGroup.attr('transform', e.transform);
+      updateLabels(e.transform.k);
+    });
+    svgSel.call(zoomBeh);
+    svgSel.on('dblclick.zoom', null);
+  } else {
+    svgSel.call(zoomBeh);
+    svgSel.on('dblclick.zoom', null);
+  }
+
+  svgSel.call(zoomBeh.transform, startT);
+  currentTransform = startT;
+  svgSel.on('click', closePanel);
+  updateLabels(startT.k);
+
+  $('btn-in').onclick    = () => svgSel.transition().duration(280).call(zoomBeh.scaleBy,1.5);
+  $('btn-out').onclick   = () => svgSel.transition().duration(280).call(zoomBeh.scaleBy,0.67);
+  $('btn-reset').onclick = () => {
+    const focusPt2 = pos[focusId];
+    if (!focusPt2) return;
+    const k = Math.min(1,(W-60)/(layout.totalW+100));
+    const t = d3.zoomIdentity.translate(W/2-focusPt2.x*k, H/2-focusPt2.y*k).scale(k);
+    svgSel.transition().duration(450).call(zoomBeh.transform, t);
+  };
+
+  window.onresize = () => svgSel.attr('width',cont.clientWidth).attr('height',cont.clientHeight);
+}
+
+function updateLabels(scale) {
+  const pMap = {};
+  allPersons.forEach(p => pMap[p.id]=p);
+  d3.selectAll('.lbl').each(function() {
+    const id = d3.select(this).attr('data-id');
+    const p  = pMap[id]; if (!p) return;
+    const pts = p.name.split(' ');
+    if (scale>0.85)      d3.select(this).text(p.name);
+    else if (scale>0.52) d3.select(this).text(pts[0]+(pts[1]?' '+pts[1][0]+'.':''));
+    else if (scale>0.30) d3.select(this).text(pts[0]);
+    else                 d3.select(this).text(pts.map(w=>w[0]).slice(0,2).join('').toUpperCase());
+  });
+}
+
+/* ══════════════════════════════════════
+   PANEL
+══════════════════════════════════════ */
+function calcAge(b,d){if(!b)return null;const m=String(b).match(/\d{4}/);if(!m)return null;const by=parseInt(m[0]);const dm=d?String(d).match(/\d{4}/):null;return(dm?parseInt(dm[0]):new Date().getFullYear())-by;}
+function fratrieLabel(r,t){if(t<=1)return null;if(r===1)return'Aîné(e)';if(r===t)return'Benjamin(e)';return'Cadet(te)';}
+function personSVG(f){const c=f?'#111110':'none',s=f?'none':'#c0beb6',w=f?0:1.5;return`<svg width="18" height="18" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="6.5" r="3.5" fill="${c}" stroke="${s}" stroke-width="${w}"/><path d="M3 17.5C3 14.186 6.134 11.5 10 11.5s7 2.686 7 6" stroke="${f?'#111110':s}" stroke-width="${f?1.5:w}" stroke-linecap="round" fill="${c}"/></svg>`;}
+
+function openPanel(id) {
+  const p = allPersons.find(x=>x.id===id); if (!p) return;
+  const parts = p.name.split(' ');
+  const photo = p.mainPhoto
+    ? `<div class="panel-photo-wrap"><img src="${p.mainPhoto}" alt="${p.name}" loading="lazy"/></div>`
+    : `<div class="panel-photo-empty"><div class="panel-photo-avatar">${parts.map(w=>w[0]).slice(0,2).join('').toUpperCase()}</div></div>`;
+  const age = calcAge(p.birth,p.death);
+  const ageHTML = age?`<span class="pill-age">${age} ans</span>`:'';
+  const dp = [p.birth?`✦ ${p.birth}`:'',p.death?`† ${p.death}`:''].filter(Boolean);
+  const datesHTML = dp.length?`<span class="pill-dates">${dp.join(' · ')}</span>`:'';
+  let fratrieHTML='';
+  if(p.birthOrder){
+    const sc=allLinks.filter(l=>{const s=l.source?.id||l.source,t=l.target?.id||l.target;return l.type==='sibling'&&(s===id||t===id);}).length;
+    const tot=sc+1,lbl=fratrieLabel(p.birthOrder,tot);
+    if(lbl){let pics='';for(let i=1;i<=tot;i++)pics+=personSVG(i===p.birthOrder);const ord=p.birthOrder===1?'1ᵉʳ':`${p.birthOrder}ᵉ`;fratrieHTML=`<div class="panel-fratrie"><div class="panel-fratrie-pictos">${pics}</div><div><span class="panel-fratrie-label">${lbl}</span><span class="panel-fratrie-sub">${ord} enfant sur ${tot}</span></div></div>`;}
+  }
+  const infoRows=[]; if(p.birthPlace)infoRows.push(`<div class="panel-info-row"><span class="panel-info-label">Lieu de naissance</span><span class="panel-info-value">${p.birthPlace}</span></div>`);
+  const infoHTML=infoRows.length?`<div class="panel-info-bloc">${infoRows.join('')}</div><hr class="panel-div"/>`:'';
+  let galleryHTML=''; if(p.photos&&p.photos.length>1){const ex=p.photos.filter(u=>u!==p.mainPhoto);if(ex.length)galleryHTML=`<hr class="panel-div"/><div class="panel-gallery-bloc"><div class="panel-gallery-label">Photos</div><div class="panel-gallery">${ex.map(u=>`<img src="${u}" alt="" loading="lazy"/>`).join('')}</div></div>`;}
+  $('panel-content').innerHTML=`${photo}<div class="panel-identity"><div class="panel-firstname">${parts[0]}</div><div class="panel-lastname">${parts.slice(1).join(' ')||parts[0]}</div>${p.nomJeuneFille?`<div class="panel-maiden">née ${p.nomJeuneFille}</div>`:''}<div class="panel-pills">${ageHTML}${datesHTML}</div>${fratrieHTML}</div><hr class="panel-div"/>${infoHTML}<div class="panel-bio-bloc"><div class="panel-bio-label">Biographie</div><p class="panel-bio">${p.bio||'<span style="opacity:.4;font-style:italic">Aucune biographie.</span>'}</p></div>${galleryHTML}<div class="panel-edit-wrap"><a href="saisie.html?edit=${id}" class="btn-edit">✎ Modifier cette fiche</a></div>`;
+  $('panel').classList.add('panel-open');
+  $('panel').classList.remove('panel-closed');
+  $('overlay').classList.add('visible');
+}
+
+function closePanel(){$('panel').className='panel-closed';$('overlay').classList.remove('visible');}
+
+function buildSearch(){
+  const inp=$('search'),res=$('search-results');
+  inp.addEventListener('input',()=>{
+    const q=inp.value.trim().toLowerCase();res.innerHTML='';
+    if(!q){res.className='';return;}
+    const m=allPersons.filter(p=>p.name.toLowerCase().includes(q)).slice(0,8);
+    if(!m.length){res.className='';return;}
+    m.forEach(p=>{const li=document.createElement('li');li.textContent=p.name;li.onclick=()=>{res.className='';inp.value='';focusId=p.id;expanded.clear();renderTree(true);};res.appendChild(li);});
+    res.className='visible';
+  });
+  document.addEventListener('click',e=>{if(!e.target.closest('.search-wrap'))res.className='';});
+}
+
+$('panel-close').onclick=e=>{e.stopPropagation();closePanel();};
+$('overlay').onclick=closePanel;
+loadData();
+</script>
+</body>
+</html>
