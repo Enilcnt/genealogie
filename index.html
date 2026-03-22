@@ -1,0 +1,563 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Mémoires — Arbre Généalogique</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet"/>
+  <link rel="stylesheet" href="style.css"/>
+</head>
+<body>
+<div id="app">
+  <header id="header">
+    <div class="header-inner">
+      <a class="site-brand" href="index.html">
+        <span class="site-title">MÉMOIRES</span>
+        <span class="site-sub">Arbre généalogique</span>
+      </a>
+      <nav class="header-nav">
+        <a href="index.html" class="nav-link active">Arbre</a>
+        <a href="saisie.html" class="nav-add">+ Ajouter</a>
+      </nav>
+      <div class="search-wrap">
+        <input id="search" type="text" placeholder="Rechercher…" autocomplete="off"/>
+        <ul id="search-results"></ul>
+      </div>
+      <div class="legend">
+        <span class="leg"><span class="leg-line parent"></span>Filiation</span>
+        <span class="leg"><span class="leg-line married"></span>Union</span>
+        <span class="leg"><span class="leg-line sibling"></span>Fratrie</span>
+      </div>
+    </div>
+  </header>
+
+  <div id="graph-container">
+    <svg id="graph"></svg>
+    <div id="zoom-btns">
+      <button id="btn-in">+</button>
+      <button id="btn-reset" style="font-size:.65rem">⌖</button>
+      <button id="btn-out">−</button>
+    </div>
+    <div id="loading-overlay"><div class="spinner"></div><p>Chargement de l'arbre…</p></div>
+    <div id="empty-state">
+      <p>L'arbre est vide pour l'instant.</p>
+      <a href="saisie.html" class="btn-primary" style="margin-top:12px">Ajouter la première personne →</a>
+    </div>
+  </div>
+
+  <aside id="panel" class="panel-closed">
+    <button id="panel-close">✕</button>
+    <div id="panel-content"></div>
+  </aside>
+  <div id="overlay"></div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+<script type="module">
+  import { initializeApp }  from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+  import { getFirestore, collection, getDocs, query, orderBy }
+                            from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+  import { FIREBASE_CONFIG } from './firebase-config.js';
+
+  const app = initializeApp(FIREBASE_CONFIG);
+  const db  = getFirestore(app);
+  const $   = id => document.getElementById(id);
+
+  const R=27, MIN_SP=130, FAM_GAP=60, ROW_H=150, PAD_T=60, PAD_L=80;
+  const LINK_STYLE = {
+    parent:  {stroke:'#2b2b28',w:1.6,op:.50,dash:null},
+    married: {stroke:'#8a8880',w:1.4,op:.45,dash:null},
+    sibling: {stroke:'#c0beb6',w:1.2,op:.70,dash:'5,4'},
+  };
+
+  function getLabel(p,scale){
+    const pts=p.name.split(' ');
+    if(scale>0.85) return p.name;
+    if(scale>0.52) return pts[0]+(pts[1]?' '+pts[1][0]+'.':'');
+    if(scale>0.30) return pts[0];
+    return pts.map(w=>w[0]).slice(0,2).join('').toUpperCase();
+  }
+
+  let allPersons=[], allLinks=[];
+  let svgSel, zoomGroup, zoomBeh, focusId=null, selectedId=null;
+
+  async function loadData(){
+    const [pSnap,lSnap]=await Promise.all([
+      getDocs(query(collection(db,'persons'),orderBy('name'))),
+      getDocs(collection(db,'links'))
+    ]);
+    allPersons=pSnap.docs.map(d=>({id:d.id,...d.data()}));
+    allLinks=lSnap.docs.map(d=>({id:d.id,...d.data()}));
+    $('loading-overlay').style.display='none';
+    if(!allPersons.length){$('empty-state').style.display='flex';return;}
+    buildSearch();
+    const lastId=localStorage.getItem('memoires-last-person');
+    const startId=(lastId&&allPersons.find(p=>p.id===lastId))?lastId:findRoot();
+    renderFocusedTree(startId);
+  }
+
+  function findRoot(){
+    const hasParent=new Set();
+    allLinks.forEach(l=>{if(l.type==='parent')hasParent.add(l.target);});
+    const roots=allPersons.filter(p=>!hasParent.has(p.id));
+    if(!roots.length) return allPersons[0]?.id;
+    roots.sort((a,b)=>(a.generation||5)-(b.generation||5));
+    return roots[0]?.id;
+  }
+
+  /* ── Construire la branche complète d'une personne ── */
+  function buildBranch(focusId){
+    const pMap={};
+    allPersons.forEach(p=>pMap[p.id]=p);
+    const parentsOf={}, childrenOf={}, spouseOf={};
+    allLinks.forEach(l=>{
+      if(l.type==='parent'){
+        (parentsOf[l.target]=parentsOf[l.target]||[]).push(l.source);
+        (childrenOf[l.source]=childrenOf[l.source]||[]).push(l.target);
+      }
+      if(l.type==='married'){spouseOf[l.source]=l.target;spouseOf[l.target]=l.source;}
+    });
+
+    const toShow=new Set();
+
+    function addAnc(id){
+      if(toShow.has(id))return;
+      toShow.add(id);
+      const sp=spouseOf[id]; if(sp)toShow.add(sp);
+      (parentsOf[id]||[]).forEach(pid=>addAnc(pid));
+    }
+    function addDesc(id){
+      if(toShow.has(id))return;
+      toShow.add(id);
+      const sp=spouseOf[id]; if(sp)toShow.add(sp);
+      (childrenOf[id]||[]).forEach(cid=>addDesc(cid));
+    }
+    function addSibs(id){
+      (parentsOf[id]||[]).forEach(pid=>{
+        (childrenOf[pid]||[]).forEach(sid=>{
+          toShow.add(sid);
+          const sp=spouseOf[sid]; if(sp)toShow.add(sp);
+        });
+      });
+    }
+
+    addAnc(focusId);
+    addDesc(focusId);
+    [...toShow].forEach(id=>addSibs(id));
+    [...toShow].forEach(id=>{
+      (childrenOf[id]||[]).forEach(cid=>{
+        toShow.add(cid);
+        const sp=spouseOf[cid]; if(sp)toShow.add(sp);
+      });
+    });
+    return [...toShow].filter(id=>pMap[id]);
+  }
+
+  /* ── Calculer les positions ── */
+  function computePositions(visibleIds){
+    const pMap={};
+    allPersons.forEach(p=>pMap[p.id]=p);
+    const visible=visibleIds.map(id=>pMap[id]).filter(Boolean);
+    const spouseOf={}, parentsOf={}, childrenOf={}, coupleChildren={};
+
+    allLinks.forEach(l=>{
+      if(!visibleIds.includes(l.source)||!visibleIds.includes(l.target))return;
+      if(l.type==='married'){spouseOf[l.source]=l.target;spouseOf[l.target]=l.source;}
+      if(l.type==='parent'){
+        (parentsOf[l.target]=parentsOf[l.target]||[]).push(l.source);
+        (childrenOf[l.source]=childrenOf[l.source]||[]).push(l.target);
+      }
+    });
+
+    visible.forEach(child=>{
+      const parents=parentsOf[child.id]||[];
+      if(!parents.length)return;
+      const p1=parents[0];
+      const p2=parents.length>=2?parents[1]:(spouseOf[p1]&&visibleIds.includes(spouseOf[p1])?spouseOf[p1]:null);
+      const key=p2?[p1,p2].sort().join('|'):p1+'|solo';
+      if(!coupleChildren[key])coupleChildren[key]=[];
+      if(!coupleChildren[key].includes(child.id))coupleChildren[key].push(child.id);
+    });
+
+    Object.keys(coupleChildren).forEach(key=>{
+      coupleChildren[key].sort((a,b)=>{
+        const pa=pMap[a],pb=pMap[b];
+        if((pa?.birthOrder||999)!==(pb?.birthOrder||999))return(pa?.birthOrder||999)-(pb?.birthOrder||999);
+        return(pa?.birth||'').localeCompare(pb?.birth||'');
+      });
+    });
+
+    const genMin=Math.min(...visible.map(p=>p.generation||1));
+    const genY=g=>PAD_T+(g-genMin)*ROW_H+R;
+
+    const famsByGen={};
+    Object.entries(coupleChildren).forEach(([key,children])=>{
+      if(!children.length)return;
+      const first=pMap[children[0]]; if(!first)return;
+      const g=first.generation||1;
+      (famsByGen[g]=famsByGen[g]||[]).push({key,children});
+    });
+
+    const lonelyByGen={};
+    visible.forEach(p=>{
+      if(!(parentsOf[p.id]||[]).length){
+        const g=p.generation||1;
+        (lonelyByGen[g]=lonelyByGen[g]||[]).push(p.id);
+      }
+    });
+
+    const sortedGens=[...new Set(visible.map(p=>p.generation||1))].sort((a,b)=>a-b);
+
+    function famW(fam){return Math.max((fam.children.length-1)*MIN_SP,0)+MIN_SP;}
+    function genTotalW(gen){
+      const fams=famsByGen[gen]||[], lone=lonelyByGen[gen]||[];
+      let w=0;
+      fams.forEach((f,i)=>{w+=famW(f);if(i<fams.length-1)w+=FAM_GAP;});
+      if(lone.length)w+=(lone.length-1)*MIN_SP+MIN_SP+(fams.length?FAM_GAP:0);
+      return w;
+    }
+
+    const totalW=Math.max(...sortedGens.map(genTotalW),400)+PAD_L*2;
+    const pos={};
+
+    sortedGens.forEach(gen=>{
+      const y=genY(gen);
+      const fams=famsByGen[gen]||[], lone=lonelyByGen[gen]||[];
+      const gw=genTotalW(gen);
+      let curX=(totalW-gw)/2;
+      fams.forEach((fam,fi)=>{
+        const n=fam.children.length;
+        fam.children.forEach((id,i)=>{pos[id]={x:curX+(n===1?0:i*MIN_SP),y};});
+        curX+=famW(fam)+(fi<fams.length-1?FAM_GAP:0);
+      });
+      if(lone.length){
+        if(fams.length)curX+=FAM_GAP;
+        lone.forEach((id,i)=>{pos[id]={x:curX+i*MIN_SP,y};});
+      }
+    });
+
+    // Centrer parents sur leurs enfants
+    [...sortedGens].reverse().forEach(gen=>{
+      (famsByGen[gen]||[]).forEach(fam=>{
+        const childXs=fam.children.map(id=>pos[id]?.x).filter(x=>x!==undefined);
+        if(!childXs.length)return;
+        const cx=(Math.min(...childXs)+Math.max(...childXs))/2;
+        const parts=fam.key.split('|'); const isSolo=parts[1]==='solo';
+        const pA=parts[0], pB=isSolo?null:parts[1];
+        const py=genY(pMap[pA]?.generation||(gen-1));
+        if(pB&&visibleIds.includes(pB)){
+          pos[pA]={x:cx-MIN_SP*0.3,y:py};
+          pos[pB]={x:cx+MIN_SP*0.3,y:py};
+        } else {
+          pos[pA]={x:cx,y:py};
+        }
+      });
+    });
+
+    // Anti-collision
+    sortedGens.forEach(gen=>{
+      const inGen=visible.filter(p=>(p.generation||1)===gen&&pos[p.id])
+        .sort((a,b)=>pos[a.id].x-pos[b.id].x);
+      for(let i=1;i<inGen.length;i++){
+        const prev=pos[inGen[i-1].id],cur=pos[inGen[i].id];
+        if(cur.x-prev.x<MIN_SP*0.75)cur.x=prev.x+MIN_SP*0.75;
+      }
+    });
+
+    return {pos,coupleChildren,totalW,spouseOf};
+  }
+
+  /* ── Rendu de l'arbre focalisé ── */
+  function renderFocusedTree(fid){
+    focusId=fid;
+    localStorage.setItem('memoires-last-person',fid);
+    if(svgSel)svgSel.selectAll('*').remove();
+
+    const cont=$('graph-container');
+    const W=cont.clientWidth, H=cont.clientHeight;
+    const pMap={}; allPersons.forEach(p=>pMap[p.id]=p);
+
+    const visibleIds=buildBranch(fid);
+    const {pos,coupleChildren,spouseOf}=computePositions(visibleIds);
+
+    const allX=Object.values(pos).map(p=>p.x);
+    const allY=Object.values(pos).map(p=>p.y);
+    const SVG_W=Math.max(W,Math.max(...allX)+PAD_L+60);
+    const SVG_H=Math.max(H,Math.max(...allY)+R+50+60);
+
+    svgSel=d3.select('#graph').attr('width',W).attr('height',H);
+    const defs=svgSel.append('defs');
+
+    visibleIds.forEach(id=>{
+      const p=pMap[id]; if(!p)return;
+      defs.append('clipPath').attr('id','clip-'+id).append('circle').attr('r',R);
+      if(p.mainPhoto){
+        const pat=defs.append('pattern').attr('id','img-'+id)
+          .attr('patternContentUnits','objectBoundingBox').attr('width',1).attr('height',1);
+        pat.append('image').attr('href',p.mainPhoto)
+          .attr('width',1).attr('height',1).attr('preserveAspectRatio','xMidYMid slice');
+      }
+    });
+
+    const focusPt=pos[fid];
+    const initK=Math.min(1,(W-60)/SVG_W);
+    const initTx=focusPt?W/2-focusPt.x*initK:Math.max(0,(W-SVG_W*initK)/2);
+    const initTy=focusPt?H/2-focusPt.y*initK:16;
+    const startT=d3.zoomIdentity.translate(initTx,initTy).scale(initK);
+
+    zoomGroup=svgSel.append('g');
+    const lineG=zoomGroup.append('g');
+    const nodeG=zoomGroup.append('g');
+
+    /* Unions */
+    const drawnU=new Set();
+    allLinks.forEach(l=>{
+      if(l.type!=='married')return;
+      if(!visibleIds.includes(l.source)||!visibleIds.includes(l.target))return;
+      const key=[l.source,l.target].sort().join(',');
+      if(drawnU.has(key))return; drawnU.add(key);
+      const pa=pos[l.source],pb=pos[l.target]; if(!pa||!pb)return;
+      const s=LINK_STYLE.married;
+      lineG.append('line')
+        .attr('x1',Math.min(pa.x,pb.x)+R+2).attr('y1',pa.y)
+        .attr('x2',Math.max(pa.x,pb.x)-R-2).attr('y2',pa.y)
+        .attr('stroke',s.stroke).attr('stroke-width',s.w).attr('stroke-opacity',s.op);
+    });
+
+    /* Filiations */
+    Object.entries(coupleChildren).forEach(([key,childIds])=>{
+      const parts=key.split('|'); const isSolo=parts[1]==='solo';
+      const pA=pos[parts[0]], pB=isSolo?null:pos[parts[1]];
+      if(!pA)return;
+      const childPos=childIds.map(id=>pos[id]).filter(Boolean);
+      if(!childPos.length)return;
+      const srcX=pB?(pA.x+pB.x)/2:pA.x;
+      const startY=pA.y+R+18;
+      const cMinX=Math.min(...childPos.map(p=>p.x));
+      const cMaxX=Math.max(...childPos.map(p=>p.x));
+      const childY=childPos[0].y;
+      const cx=(cMinX+cMaxX)/2;
+      const midY=startY+(childY-R-startY)*0.5;
+      const s=LINK_STYLE.parent;
+      lineG.append('line').attr('x1',srcX).attr('y1',startY).attr('x2',srcX).attr('y2',midY)
+        .attr('stroke',s.stroke).attr('stroke-width',s.w).attr('stroke-opacity',s.op);
+      if(Math.abs(srcX-cx)>3)
+        lineG.append('line').attr('x1',srcX).attr('y1',midY).attr('x2',cx).attr('y2',midY)
+          .attr('stroke',s.stroke).attr('stroke-width',s.w).attr('stroke-opacity',s.op);
+      if(childIds.length>1)
+        lineG.append('line').attr('x1',cMinX).attr('y1',midY).attr('x2',cMaxX).attr('y2',midY)
+          .attr('stroke',s.stroke).attr('stroke-width',s.w).attr('stroke-opacity',s.op);
+      childPos.forEach(cp=>{
+        lineG.append('line').attr('x1',cp.x).attr('y1',midY).attr('x2',cp.x).attr('y2',cp.y-R)
+          .attr('stroke',s.stroke).attr('stroke-width',s.w).attr('stroke-opacity',s.op);
+      });
+    });
+
+    /* Fratrie */
+    const drawnF=new Set();
+    Object.entries(coupleChildren).forEach(([,siblings])=>{
+      if(siblings.length<2)return;
+      const key=siblings.slice().sort().join(',');
+      if(drawnF.has(key))return; drawnF.add(key);
+      const positions=siblings.map(id=>pos[id]).filter(Boolean);
+      if(positions.length<2)return;
+      const minX=Math.min(...positions.map(p=>p.x));
+      const maxX=Math.max(...positions.map(p=>p.x));
+      const fratY=positions[0].y+R+22;
+      const s=LINK_STYLE.sibling;
+      lineG.append('line').attr('x1',minX).attr('y1',fratY).attr('x2',maxX).attr('y2',fratY)
+        .attr('stroke',s.stroke).attr('stroke-width',s.w).attr('stroke-opacity',s.op)
+        .attr('stroke-dasharray',s.dash);
+    });
+
+    /* Nœuds */
+    visibleIds.forEach(id=>{
+      const p=pMap[id]; if(!p)return;
+      const pt=pos[id]; if(!pt)return;
+      const isFocus=id===fid;
+      const g=nodeG.append('g')
+        .attr('transform',`translate(${pt.x},${pt.y})`)
+        .attr('id','node-'+id)
+        .style('cursor','pointer');
+
+      if(isFocus){
+        g.append('circle').attr('r',R+7).attr('fill','none')
+          .attr('stroke','#111110').attr('stroke-width',2).attr('opacity',.15);
+      }
+
+      g.append('circle').attr('class','ring').attr('r',R+5).attr('fill','none')
+        .attr('stroke','#111110').attr('stroke-width',0).attr('opacity',0);
+
+      g.append('circle').attr('r',R)
+        .attr('fill',p.mainPhoto?`url(#img-${id})`:'#f0efed')
+        .attr('stroke',isFocus?'#111110':'rgba(255,255,255,0.85)')
+        .attr('stroke-width',isFocus?2.5:2)
+        .style('filter','drop-shadow(3px 3px 6px rgba(0,0,0,0.09)) drop-shadow(-2px -2px 4px rgba(255,255,255,0.70))');
+
+      if(!p.mainPhoto){
+        const pts=p.name.split(' ');
+        g.append('text').attr('text-anchor','middle').attr('dominant-baseline','central')
+          .attr('font-size','11px').attr('font-weight',isFocus?'700':'600')
+          .attr('fill',isFocus?'#111110':'#47463f').attr('pointer-events','none')
+          .text(pts.map(w=>w[0]).slice(0,2).join('').toUpperCase());
+      }
+
+      g.append('text').attr('class','lbl').attr('data-id',id)
+        .attr('y',R+14).attr('text-anchor','middle')
+        .attr('font-family','-apple-system,Helvetica Neue,sans-serif')
+        .attr('font-size','11px').attr('font-weight',isFocus?'700':'500')
+        .attr('fill',isFocus?'#111110':'#47463f').attr('pointer-events','none');
+
+      g.on('mouseenter',function(){
+          d3.select(this).select('.ring').attr('stroke-width',2.5).attr('opacity',.22);
+        })
+        .on('mouseleave',function(){
+          d3.select(this).select('.ring').attr('stroke-width',0).attr('opacity',0);
+        })
+        .on('click',e=>{
+          e.stopPropagation();
+          if(id===focusId){
+            openPanel(id);
+          } else {
+            closePanel();
+            renderFocusedTree(id);
+          }
+        });
+    });
+
+    /* Zoom */
+    zoomBeh=d3.zoom().scaleExtent([0.08,3]).on('zoom',e=>{
+      zoomGroup.attr('transform',e.transform);
+      updateLabels(e.transform.k*initK);
+    });
+    svgSel.call(zoomBeh).on('dblclick.zoom',null);
+    svgSel.call(zoomBeh.transform,startT);
+    svgSel.on('click',closePanel);
+    updateLabels(initK);
+
+    $('btn-in').onclick    =()=>svgSel.transition().duration(280).call(zoomBeh.scaleBy,1.5);
+    $('btn-out').onclick   =()=>svgSel.transition().duration(280).call(zoomBeh.scaleBy,0.67);
+    $('btn-reset').onclick =()=>svgSel.transition().duration(450).call(zoomBeh.transform,startT);
+
+    window.addEventListener('resize',()=>{
+      svgSel.attr('width',cont.clientWidth).attr('height',cont.clientHeight);
+    });
+  }
+
+  function updateLabels(scale){
+    d3.selectAll('.lbl').each(function(){
+      const id=d3.select(this).attr('data-id');
+      const p=allPersons.find(x=>x.id===id);
+      if(p)d3.select(this).text(getLabel(p,scale));
+    });
+  }
+
+  /* ── Panel ── */
+  function calcAge(birth,death){
+    if(!birth)return null;
+    const m=String(birth).match(/\d{4}/); if(!m)return null;
+    const by=parseInt(m[0]);
+    const dm=death?String(death).match(/\d{4}/):null;
+    return(dm?parseInt(dm[0]):new Date().getFullYear())-by;
+  }
+  function fratrieLabel(rank,total){
+    if(total<=1)return null;
+    if(rank===1)return'Aîné(e)';
+    if(rank===total)return'Benjamin(e)';
+    return'Cadet(te)';
+  }
+  function personSVG(filled){
+    const col=filled?'#111110':'none';
+    const str=filled?'none':'#c0beb6';
+    const sw=filled?0:1.5;
+    return`<svg width="18" height="18" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="6.5" r="3.5" fill="${col}" stroke="${str}" stroke-width="${sw}"/><path d="M3 17.5C3 14.186 6.134 11.5 10 11.5s7 2.686 7 6" stroke="${filled?'#111110':str}" stroke-width="${filled?1.5:sw}" stroke-linecap="round" fill="${col}"/></svg>`;
+  }
+
+  function openPanel(id){
+    const p=allPersons.find(x=>x.id===id); if(!p)return;
+    selectedId=id;
+    const parts=p.name.split(' ');
+    const photo=p.mainPhoto
+      ?`<div class="panel-photo-wrap"><img src="${p.mainPhoto}" alt="${p.name}" loading="lazy"/></div>`
+      :`<div class="panel-photo-empty"><div class="panel-photo-avatar">${parts.map(w=>w[0]).slice(0,2).join('').toUpperCase()}</div></div>`;
+    const maidenHTML=p.nomJeuneFille?`<div class="panel-maiden">née ${p.nomJeuneFille}</div>`:'';
+    const age=calcAge(p.birth,p.death);
+    const ageHTML=age?`<span class="pill-age">${age} ans</span>`:'';
+    const dateParts=[p.birth?`✦ ${p.birth}`:'',p.death?`† ${p.death}`:''].filter(Boolean);
+    const datesHTML=dateParts.length?`<span class="pill-dates">${dateParts.join(' · ')}</span>`:'';
+    let fratrieHTML='';
+    if(p.birthOrder){
+      const sibCount=allLinks.filter(l=>{
+        const s=l.source?.id||l.source,t=l.target?.id||l.target;
+        return l.type==='sibling'&&(s===id||t===id);
+      }).length;
+      const total=sibCount+1;
+      const lbl=fratrieLabel(p.birthOrder,total);
+      if(lbl){
+        let pictos='';
+        for(let i=1;i<=total;i++)pictos+=personSVG(i===p.birthOrder);
+        const ord=p.birthOrder===1?'1ᵉʳ':`${p.birthOrder}ᵉ`;
+        fratrieHTML=`<div class="panel-fratrie"><div class="panel-fratrie-pictos">${pictos}</div><div><span class="panel-fratrie-label">${lbl}</span><span class="panel-fratrie-sub">${ord} enfant sur ${total}</span></div></div>`;
+      }
+    }
+    const infoRows=[];
+    if(p.birthPlace)infoRows.push(`<div class="panel-info-row"><span class="panel-info-label">Lieu de naissance</span><span class="panel-info-value">${p.birthPlace}</span></div>`);
+    const infoHTML=infoRows.length?`<div class="panel-info-bloc">${infoRows.join('')}</div><hr class="panel-div"/>`:'';
+    let galleryHTML='';
+    if(p.photos&&p.photos.length>1){
+      const extras=p.photos.filter(u=>u!==p.mainPhoto);
+      if(extras.length)galleryHTML=`<hr class="panel-div"/><div class="panel-gallery-bloc"><div class="panel-gallery-label">Photos</div><div class="panel-gallery">${extras.map(u=>`<img src="${u}" alt="" loading="lazy"/>`).join('')}</div></div>`;
+    }
+    $('panel-content').innerHTML=`
+      ${photo}
+      <div class="panel-identity">
+        <div class="panel-firstname">${parts[0]}</div>
+        <div class="panel-lastname">${parts.slice(1).join(' ')||parts[0]}</div>
+        ${maidenHTML}
+        <div class="panel-pills">${ageHTML}${datesHTML}</div>
+        ${fratrieHTML}
+      </div>
+      <hr class="panel-div"/>
+      ${infoHTML}
+      <div class="panel-bio-bloc">
+        <div class="panel-bio-label">Biographie</div>
+        <p class="panel-bio">${p.bio||'<span style="opacity:.4;font-style:italic">Aucune biographie.</span>'}</p>
+      </div>
+      ${galleryHTML}
+      <div class="panel-edit-wrap"><a href="saisie.html?edit=${id}" class="btn-edit">✎ Modifier cette fiche</a></div>
+    `;
+    $('panel').classList.add('panel-open');
+    $('panel').classList.remove('panel-closed');
+    $('overlay').classList.add('visible');
+  }
+
+  function closePanel(){
+    $('panel').className='panel-closed';
+    $('overlay').classList.remove('visible');
+    selectedId=null;
+  }
+
+  function buildSearch(){
+    const inp=$('search'),res=$('search-results');
+    inp.addEventListener('input',()=>{
+      const q=inp.value.trim().toLowerCase(); res.innerHTML='';
+      if(!q){res.className='';return;}
+      const m=allPersons.filter(p=>p.name.toLowerCase().includes(q)).slice(0,8);
+      if(!m.length){res.className='';return;}
+      m.forEach(p=>{
+        const li=document.createElement('li');li.textContent=p.name;
+        li.onclick=()=>{res.className='';inp.value='';renderFocusedTree(p.id);};
+        res.appendChild(li);
+      });
+      res.className='visible';
+    });
+    document.addEventListener('click',e=>{if(!e.target.closest('.search-wrap'))res.className='';});
+  }
+
+  $('panel-close').onclick=e=>{e.stopPropagation();closePanel();};
+  $('overlay').onclick=closePanel;
+  loadData();
+</script>
+</body>
+</html>
